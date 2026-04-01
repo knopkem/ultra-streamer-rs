@@ -4,7 +4,17 @@ description = "GPU frame capture from wgpu render targets — zero-copy (Metal/N
 version.workspace = true
 edition.workspace = true
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
 [dependencies]
 wgpu = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.32.0"
+objc = "0.2.7"
+objc2-core-foundation = "0.3.2"
+objc2-core-video = { version = "0.3.2", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3.2"

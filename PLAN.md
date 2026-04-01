@@ -15,6 +15,18 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Controlled browser** — can mandate Chrome/Chromium → unlock WebTransport + WebCodecs
 - **Low network jitter** — wired ethernet, predictable sub-1ms RTT
 
+### Current Progress Snapshot
+- **Implemented:** binary frame/input protocol, staging-buffer capture fallback, Rust input mapping, adaptive quality state machine
+- **Implemented:** WebTransport session layer (`wtransport` over `quinn`) with tested datagram + reliable stream paths
+- **Implemented:** browser client with WebTransport/WebSocket connect, frame reassembly, WebCodecs decode path, and binary input forwarding
+- **Implemented:** macOS zero-copy Metal/IOSurface capture and direct VideoToolbox HEVC encode backend with WebCodecs-ready `hvcC` extraction
+- **Implemented:** CPU/staging-backed VideoToolbox input path for headless smoke testing and fallback encode
+- **Implemented:** adaptive quality tier capping from RTT/loss samples with recovery/degrade hysteresis
+- **Implemented:** WebSocket fallback server/session path with browser fallback wiring
+- **Implemented:** typed control-message protocol plus browser metrics dashboard hooks for decode time, frame drops, encode time, and RTT
+- **Implemented:** headless live-test server (`cargo run -p ustreamer-demo`) serving the browser client and streaming an offscreen `wgpu` scene over WebSocket
+- **Next up:** lossless diagnostic settle propagation and the NVIDIA zero-copy/NVENC path
+
 ---
 
 ## 1. End-to-End Pipeline Overview
@@ -290,8 +302,8 @@ writer.write(new Uint8Array([CMD_KEY_DOWN, keyCode]));
 
 | Crate | Purpose | Notes |
 |-------|---------|-------|
-| `quinn` | QUIC/HTTP3 server (WebTransport) | Mature QUIC implementation for Rust |
-| `h3` + `h3-quinn` | HTTP/3 layer over quinn | Required for WebTransport handshake |
+| `quinn` | QUIC transport foundation | Mature QUIC implementation for Rust |
+| `wtransport` | WebTransport server/session layer | Wraps the HTTP/3 + WebTransport handshake on top of quinn |
 | `tokio` | Async runtime | Mature async runtime for Rust |
 | `axum` | HTTPS server for initial page load | Serves HTML/JS client |
 
@@ -671,27 +683,27 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 ## 11. Implementation Phases / Todos
 
 ### Phase 1: Zero-Copy Encode + WebTransport MVP (Mac M4 first)
-- **capture-metal-zerocopy**: wgpu-hal Metal texture → IOSurface extraction → CVPixelBuffer wrapper
-- **encoder-videotoolbox**: Direct VTCompressionSession FFI via objc2 — H.265 Main10, real-time mode, lossless toggle
-- **transport-webtransport**: QUIC/HTTP3 server using quinn + h3-quinn, WebTransport session handling, datagram send/receive
-- **frame-packetizer**: Encode NALU fragmentation into QUIC datagrams with frame ID, fragment index, keyframe flag
-- **browser-client-webcodecs**: HTML/JS client: WebTransport connect → reassemble datagrams → WebCodecs VideoDecoder → Canvas
-- **input-capture-binary**: Browser-side PointerEvent/KeyboardEvent → compact binary encoding → QUIC datagrams (unreliable) + stream (reliable)
-- **input-bridge-rust**: Rust-side binary input decode → map to abstract AppAction events for the consumer application
+- **capture-metal-zerocopy** *(done)*: wgpu-hal Metal texture → IOSurface extraction → CVPixelBuffer wrapper
+- **encoder-videotoolbox** *(done)*: Direct VTCompressionSession FFI via objc2 — HEVC real-time encode, keyframe forcing, and `hvcC` decoder-config extraction
+- **transport-webtransport** *(done)*: WebTransport session handling via `wtransport`/`quinn`, datagram send/receive, reliable stream control path
+- **frame-packetizer** *(done)*: Encode NALU fragmentation into QUIC datagrams with frame ID, fragment index, keyframe flag
+- **browser-client-webcodecs** *(done)*: HTML/JS client with WebTransport connect, datagram reassembly, WebCodecs decode path, metrics
+- **input-capture-binary** *(done)*: Browser-side PointerEvent/KeyboardEvent → compact binary encoding → QUIC datagrams (unreliable) + stream (reliable)
+- **input-bridge-rust** *(done)*: Rust-side binary input decode → map to abstract AppAction events for the consumer application
 
 ### Phase 2: NVIDIA + Quality + Lossless
 - **capture-nvenc-zerocopy**: wgpu-hal Vulkan texture → VkImage export → CUDA external memory import → NVENC register resource
 - **encoder-nvenc-direct**: Direct NVENC encoder via nvidia-video-codec-rs — H.265/AV1, ultra-low-latency tuning
 - **lossless-settle**: Idle detection (150–300ms) → switch encoder to lossless QP=0 → send I-frame → browser replaces canvas
 - **lossless-checksum**: Server computes frame hash, sends with lossless frame, browser verifies pixel-perfect delivery
-- **adaptive-quality**: Monitor QUIC RTT + loss → adjust bitrate/resolution tier (720p→1080p→4K), adjust framerate on idle
+- **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle
 - **browser-overlay-hybrid**: Move toolbars/metadata/annotations to native HTML/SVG overlay, reducing encoded viewport
 
 ### Phase 3: Polish + AMD Fallback
 - **encoder-gstreamer-fallback**: GStreamer-based encoder for AMD and unsupported GPUs (H.265 via amfenc/vaapih265enc)
-- **capture-staging-fallback**: Triple-buffered copy_texture_to_buffer for platforms without zero-copy interop
-- **transport-ws-fallback**: WebSocket fallback transport for non-Chrome browsers (same WebCodecs decode)
-- **headless-server**: Run viewer without window for dedicated server deployment (wgpu headless device)
+- **capture-staging-fallback** *(done)*: Triple-buffered copy_texture_to_buffer for platforms without zero-copy interop
+- **transport-ws-fallback** *(done)*: WebSocket fallback transport for non-Chrome browsers (same WebCodecs decode)
+- **headless-server** *(done)*: Run viewer without window for dedicated server deployment (wgpu headless device)
 - **multi-client**: Multiple simultaneous browser sessions from one server (independent encode sessions)
 - **av1-support**: Enable AV1 encoding on RTX 40+/M4 Pro+ with codec negotiation at session start
 
@@ -699,7 +711,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **roi-encoding**: Per-region QP: high quality at cursor/ROI, lower at periphery
 - **delta-encoding**: Dirty-region tracking in renderer → only re-encode changed tiles
 - **input-prediction**: Client-side scroll/rotate prediction with server correction
-- **perf-dashboard**: Real-time latency/quality metrics overlay (encode time, network RTT, decode time, frame drop rate)
+- **perf-dashboard** *(done)*: Real-time latency/quality metrics overlay (encode time, network RTT, decode time, frame drop rate)
 
 ---
 
@@ -714,7 +726,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 | WebCodecs `optimizeForLatency` behavior varies | Decode latency unpredictable | Benchmark on target hardware; worst case add manual frame pacing |
 | Lossless H.265 frame size at 4K can be 5–15 MB | Momentary bandwidth spike | LAN handles it (5 MB @ 1 Gbps = 40µs). Rate-limit to one lossless frame per settle. |
 | objc2 FFI to VideoToolbox is verbose/unsafe | Dev effort on Mac | Create a thin safe wrapper crate; reference apple-sys/core-video bindings |
-| quinn WebTransport support is still maturing | Transport reliability | h3-quinn has active development; fallback to raw QUIC datagrams if needed |
+| Rust WebTransport support is still maturing | Transport reliability | Use `wtransport` today; keep raw QUIC/WebSocket fallback options available if browser/runtime quirks appear |
 
 ---
 

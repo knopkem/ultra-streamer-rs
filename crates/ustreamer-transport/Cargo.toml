@@ -7,8 +7,11 @@ edition.workspace = true
 [dependencies]
 ustreamer-proto = { workspace = true }
 quinn = { workspace = true }
+wtransport = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"

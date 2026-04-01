@@ -5,6 +5,7 @@
 //! - Input events (browser → server)
 //! - Quality/session control messages (bidirectional)
 
+pub mod control;
 pub mod frame;
 pub mod input;
 pub mod quality;

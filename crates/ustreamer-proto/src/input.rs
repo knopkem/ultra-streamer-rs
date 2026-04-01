@@ -17,18 +17,10 @@ pub enum InputEvent {
     },
 
     /// Discrete pointer button press (sent reliably).
-    PointerDown {
-        button: u8,
-        x: f32,
-        y: f32,
-    },
+    PointerDown { button: u8, x: f32, y: f32 },
 
     /// Discrete pointer button release (sent reliably).
-    PointerUp {
-        button: u8,
-        x: f32,
-        y: f32,
-    },
+    PointerUp { button: u8, x: f32, y: f32 },
 
     /// Scroll / wheel event (unreliable).
     Scroll {
@@ -63,7 +55,12 @@ impl InputEvent {
     /// Serialize to compact binary format.
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            InputEvent::PointerMove { x, y, buttons, timestamp_ms } => {
+            InputEvent::PointerMove {
+                x,
+                y,
+                buttons,
+                timestamp_ms,
+            } => {
                 let mut buf = Vec::with_capacity(14);
                 buf.push(TAG_POINTER_MOVE);
                 buf.push(*buttons);
@@ -88,7 +85,11 @@ impl InputEvent {
                 buf.extend_from_slice(&y.to_le_bytes());
                 buf
             }
-            InputEvent::Scroll { delta_x, delta_y, mode } => {
+            InputEvent::Scroll {
+                delta_x,
+                delta_y,
+                mode,
+            } => {
                 let mut buf = Vec::with_capacity(10);
                 buf.push(TAG_SCROLL);
                 buf.extend_from_slice(&delta_x.to_le_bytes());
@@ -171,7 +172,12 @@ mod tests {
         let bytes = event.to_bytes();
         let decoded = InputEvent::from_bytes(&bytes).unwrap();
         match decoded {
-            InputEvent::PointerMove { x, y, buttons, timestamp_ms } => {
+            InputEvent::PointerMove {
+                x,
+                y,
+                buttons,
+                timestamp_ms,
+            } => {
                 assert!((x - 0.5).abs() < f32::EPSILON);
                 assert!((y - 0.75).abs() < f32::EPSILON);
                 assert_eq!(buttons, 1);

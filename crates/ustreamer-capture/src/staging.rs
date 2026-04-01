@@ -107,6 +107,7 @@ impl FrameCapture for StagingCapture {
             width: size.width,
             height: size.height,
             stride: unpadded_row_bytes,
+            format,
         })
     }
 }

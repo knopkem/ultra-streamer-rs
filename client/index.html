@@ -5,62 +5,1266 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ultra-streamer</title>
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #1a1a2e; color: #eee; font-family: system-ui; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
     #viewer-container {
       position: relative;
       width: 100vw;
       height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at top, rgba(59, 130, 246, 0.18), transparent 40%),
+        linear-gradient(180deg, #111827, #020617);
     }
     canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
       background: #000;
-      max-width: 100%;
-      max-height: 100%;
+      outline: none;
+    }
+    #hud {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: none;
+    }
+    .panel {
+      min-width: 260px;
+      max-width: min(440px, calc(100vw - 24px));
+      padding: 12px 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.82);
+      box-shadow: 0 20px 40px rgba(2, 6, 23, 0.45);
+      backdrop-filter: blur(10px);
+      pointer-events: auto;
     }
     #status {
-      position: absolute;
-      top: 8px;
-      left: 8px;
-      font-size: 12px;
-      opacity: 0.7;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    #status.error {
+      color: #fca5a5;
     }
     #metrics {
+      margin-top: 8px;
+      color: #cbd5e1;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    #controls {
       position: absolute;
-      top: 8px;
-      right: 8px;
-      font-size: 11px;
-      font-family: monospace;
-      opacity: 0.7;
-      text-align: right;
+      left: 12px;
+      right: 12px;
+      bottom: 12px;
+      display: grid;
+      gap: 10px;
+      width: min(680px, calc(100vw - 24px));
+      padding: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 14px;
+      background: rgba(15, 23, 42, 0.82);
+      box-shadow: 0 20px 40px rgba(2, 6, 23, 0.45);
+      backdrop-filter: blur(10px);
+    }
+    #controls h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    #controls p {
+      margin: 0;
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    label {
+      display: grid;
+      gap: 6px;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+    input, textarea, button {
+      width: 100%;
+      border: 1px solid rgba(148, 163, 184, 0.28);
+      border-radius: 10px;
+      background: rgba(15, 23, 42, 0.95);
+      color: #f8fafc;
+      font: inherit;
+      padding: 10px 12px;
+    }
+    input::placeholder, textarea::placeholder {
+      color: #64748b;
+    }
+    textarea {
+      min-height: 76px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .buttons {
+      display: flex;
+      gap: 10px;
+    }
+    button {
+      cursor: pointer;
+      font-weight: 600;
+    }
+    button.primary {
+      background: linear-gradient(180deg, #2563eb, #1d4ed8);
+      border-color: rgba(96, 165, 250, 0.4);
+    }
+    button.secondary {
+      background: rgba(30, 41, 59, 0.95);
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+    }
+    #log {
+      color: #cbd5e1;
+      font-size: 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      max-height: 140px;
+      overflow: auto;
+    }
+    #focus-hint {
+      position: absolute;
+      right: 12px;
+      bottom: 12px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: rgba(2, 6, 23, 0.72);
+      color: #cbd5e1;
+      font-size: 12px;
+      pointer-events: none;
+    }
+    @media (max-width: 720px) {
+      #hud {
+        position: static;
+        padding: 12px 12px 0;
+        flex-direction: column;
+      }
+      #controls {
+        position: static;
+        width: auto;
+        margin: 12px;
+      }
+      #focus-hint {
+        position: static;
+        margin: 0 12px 12px;
+      }
+      .grid {
+        grid-template-columns: 1fr;
+      }
     }
   </style>
 </head>
 <body>
   <div id="viewer-container">
     <canvas id="viewer" width="1920" height="1080" tabindex="0"></canvas>
-    <div id="status">Connecting...</div>
-    <div id="metrics"></div>
+
+    <div id="hud">
+      <div class="panel">
+        <div id="status">Client loaded. Configure the transport endpoint and connect.</div>
+        <div id="metrics"></div>
+      </div>
+    </div>
+
+    <div id="controls">
+      <div>
+        <h1>ultra-streamer browser client</h1>
+        <p>
+          Chrome/Chromium only for now. This client connects with WebTransport, reassembles
+          frame datagrams, feeds them into WebCodecs, and forwards pointer/keyboard input with
+          the compact binary protocol.
+        </p>
+      </div>
+
+      <div class="grid">
+        <label>
+          Stream URL
+          <input id="url" type="text" placeholder="https://127.0.0.1:4433/stream or ws://127.0.0.1:8080/stream">
+        </label>
+        <label>
+          Codec string
+          <input id="codec" type="text" value="hvc1.1.6.L153.B0" placeholder="hvc1... or av01...">
+        </label>
+      </div>
+
+      <div class="grid">
+        <label>
+          Server certificate SHA-256 hash
+          <input id="cert-hash" type="text" placeholder="Optional for trusted certs; required for self-signed">
+        </label>
+        <label>
+          Decoder description (base64, optional)
+          <input id="description" type="text" placeholder="hvcC / avcC extradata if needed">
+        </label>
+      </div>
+
+      <div class="buttons">
+        <button id="connect" class="primary" type="button">Connect</button>
+        <button id="disconnect" class="secondary" type="button" disabled>Disconnect</button>
+        <button id="apply-decoder" class="secondary" type="button">Apply decoder config</button>
+      </div>
+
+      <div id="log" aria-live="polite"></div>
+    </div>
+
+    <div id="focus-hint">Click the canvas to focus input.</div>
   </div>
 
   <script>
-    // ultra-streamer browser client — placeholder for Phase 1 implementation
-    // Will connect via WebTransport, decode with WebCodecs, capture input
-    const canvas = document.getElementById('viewer');
-    const status = document.getElementById('status');
-    const metrics = document.getElementById('metrics');
-    const ctx = canvas.getContext('2d');
+    const FRAME_PACKET_HEADER_SIZE = 18;
+    const INPUT_POINTER_MOVE = 0x01;
+    const INPUT_POINTER_DOWN = 0x02;
+    const INPUT_POINTER_UP = 0x03;
+    const INPUT_SCROLL = 0x04;
+    const INPUT_KEY_DOWN = 0x10;
+    const INPUT_KEY_UP = 0x11;
+    const STALE_FRAME_TIMEOUT_MS = 250;
+    const MAX_BUFFERED_FRAMES = 24;
+    const DECODER_CONFIG_CONTROL = "decoder-config";
+    const SESSION_METRICS_CONTROL = "session-metrics";
 
-    status.textContent = 'Client loaded — waiting for WebTransport server';
+    const canvas = document.getElementById("viewer");
+    const statusElement = document.getElementById("status");
+    const metricsElement = document.getElementById("metrics");
+    const logElement = document.getElementById("log");
+    const urlInput = document.getElementById("url");
+    const codecInput = document.getElementById("codec");
+    const certHashInput = document.getElementById("cert-hash");
+    const descriptionInput = document.getElementById("description");
+    const connectButton = document.getElementById("connect");
+    const disconnectButton = document.getElementById("disconnect");
+    const applyDecoderButton = document.getElementById("apply-decoder");
+    const ctx = canvas.getContext("2d", { alpha: false });
 
-    // TODO Phase 1:
-    // 1. WebTransport connection to server
-    // 2. WebCodecs VideoDecoder setup (H.265 Main10, optimizeForLatency)
-    // 3. Datagram reassembly → EncodedVideoChunk → decoder → canvas
-    // 4. Input capture (PointerEvent, KeyboardEvent, wheel) → binary → datagrams
-    // 5. Latency metrics display
+    urlInput.value = defaultTransportUrl();
+
+    if (!("VideoDecoder" in window)) {
+      setStatus("WebCodecs VideoDecoder is not available in this browser.", true);
+    } else if (!("WebTransport" in window)) {
+      setStatus("WebTransport is not available in this browser. Use a ws:// or wss:// fallback URL.");
+    }
+
+    const keyCodeMap = new Map([
+      ["Escape", 27],
+      ["Tab", 9],
+      ["Enter", 13],
+      ["Space", 32],
+      ["Backspace", 8],
+      ["Delete", 46],
+      ["ArrowUp", 38],
+      ["ArrowDown", 40],
+      ["ArrowLeft", 37],
+      ["ArrowRight", 39],
+      ["Home", 36],
+      ["End", 35],
+      ["PageUp", 33],
+      ["PageDown", 34],
+      ["Insert", 45],
+      ["ShiftLeft", 16],
+      ["ShiftRight", 16],
+      ["ControlLeft", 17],
+      ["ControlRight", 17],
+      ["AltLeft", 18],
+      ["AltRight", 18],
+      ["MetaLeft", 91],
+      ["MetaRight", 92],
+      ["F1", 112],
+      ["F2", 113],
+      ["F3", 114],
+      ["F4", 115],
+      ["F5", 116],
+      ["F6", 117],
+      ["F7", 118],
+      ["F8", 119],
+      ["F9", 120],
+      ["F10", 121],
+      ["F11", 122],
+      ["F12", 123],
+    ]);
+
+    class FrameReassembler {
+      constructor() {
+        this.frames = new Map();
+      }
+
+      push(packet) {
+        const now = performance.now();
+        let evictedFrames = this.evictStale(now);
+
+        let entry = this.frames.get(packet.frameId);
+        if (!entry) {
+          entry = {
+            createdAt: now,
+            frameId: packet.frameId,
+            fragmentCount: packet.fragmentCount,
+            fragments: new Array(packet.fragmentCount),
+            receivedCount: 0,
+            timestampUs: packet.timestampUs,
+            isKeyframe: packet.isKeyframe,
+            isLossless: packet.isLossless,
+          };
+          this.frames.set(packet.frameId, entry);
+        }
+
+        if (!entry.fragments[packet.fragmentIdx]) {
+          entry.fragments[packet.fragmentIdx] = packet.payload;
+          entry.receivedCount += 1;
+        }
+
+        if (entry.receivedCount !== entry.fragmentCount) {
+          return { frame: null, evictedFrames };
+        }
+
+        this.frames.delete(packet.frameId);
+
+        let totalLength = 0;
+        for (const fragment of entry.fragments) {
+          totalLength += fragment.byteLength;
+        }
+
+        const data = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const fragment of entry.fragments) {
+          data.set(fragment, offset);
+          offset += fragment.byteLength;
+        }
+
+        return {
+          frame: {
+            frameId: entry.frameId,
+            timestampUs: entry.timestampUs,
+            isKeyframe: entry.isKeyframe,
+            isLossless: entry.isLossless,
+            data,
+          },
+          evictedFrames,
+        };
+      }
+
+      evictStale(now) {
+        let evictedFrames = 0;
+        for (const [frameId, entry] of this.frames) {
+          if (now - entry.createdAt > STALE_FRAME_TIMEOUT_MS) {
+            this.frames.delete(frameId);
+            evictedFrames += 1;
+          }
+        }
+
+        if (this.frames.size <= MAX_BUFFERED_FRAMES) {
+          return evictedFrames;
+        }
+
+        const oldest = [...this.frames.entries()]
+          .sort((left, right) => left[1].createdAt - right[1].createdAt)
+          .slice(0, this.frames.size - MAX_BUFFERED_FRAMES);
+
+        for (const [frameId] of oldest) {
+          this.frames.delete(frameId);
+          evictedFrames += 1;
+        }
+
+        return evictedFrames;
+      }
+    }
+
+    class UltraStreamerClient {
+      constructor() {
+        this.transport = null;
+        this.ws = null;
+        this.datagramReader = null;
+        this.datagramWriter = null;
+        this.controlReader = null;
+        this.decoder = null;
+        this.decoderConfigured = false;
+        this.decoderConfigKey = "";
+        this.reassembler = new FrameReassembler();
+        this.pendingDecodes = new Map();
+        this.seenKeyframe = false;
+        this.connected = false;
+        this.connectionMode = "none";
+        this.metrics = createEmptyMetrics();
+      }
+
+      beginConnectedSession(url, mode, statusMessage) {
+        this.connected = true;
+        this.connectionMode = mode;
+        this.seenKeyframe = false;
+        this.reassembler = new FrameReassembler();
+        this.pendingDecodes = new Map();
+        this.metrics = createEmptyMetrics();
+
+        updateButtons(true);
+        canvas.focus();
+        setStatus(statusMessage);
+        logLine(`Connected to ${url} via ${mode}.`);
+        this.updateMetrics();
+      }
+
+      resetSessionState(statusMessage) {
+        if (this.decoder && this.decoder.state !== "closed") {
+          this.decoder.close();
+        }
+        this.decoder = null;
+        this.decoderConfigured = false;
+        this.decoderConfigKey = "";
+        this.seenKeyframe = false;
+        this.reassembler = new FrameReassembler();
+        this.pendingDecodes = new Map();
+        this.connectionMode = "none";
+
+        updateButtons(false);
+        setStatus(statusMessage);
+        this.updateMetrics();
+      }
+
+      async connectWebSocket(url) {
+        setStatus("Connecting to WebSocket fallback...");
+
+        const ws = new WebSocket(url);
+        ws.binaryType = "arraybuffer";
+
+        await new Promise((resolve, reject) => {
+          const cleanup = () => {
+            ws.removeEventListener("open", onOpen);
+            ws.removeEventListener("error", onError);
+          };
+
+          const onOpen = () => {
+            cleanup();
+            resolve();
+          };
+
+          const onError = () => {
+            cleanup();
+            reject(new Error("WebSocket connection failed."));
+          };
+
+          ws.addEventListener("open", onOpen, { once: true });
+          ws.addEventListener("error", onError, { once: true });
+        });
+
+        ws.addEventListener("message", (event) => {
+          this.handleWebSocketMessage(event).catch((error) => {
+            if (this.connected) {
+              setStatus(`WebSocket message handling failed: ${formatError(error)}`, true);
+            }
+          });
+        });
+        ws.addEventListener("close", () => {
+          if (this.ws === ws) {
+            this.ws = null;
+            this.connected = false;
+            this.resetSessionState("WebSocket closed.");
+          }
+        });
+        ws.addEventListener("error", () => {
+          if (this.ws === ws && this.connected) {
+            setStatus("WebSocket transport error.", true);
+          }
+        });
+
+        this.ws = ws;
+        this.beginConnectedSession(
+          url,
+          "WebSocket",
+          "Connected via WebSocket. Waiting for frame messages..."
+        );
+
+        if (codecInput.value.trim()) {
+          await this.applyManualDecoderConfig();
+        }
+      }
+
+      async handleWebSocketMessage(event) {
+        if (typeof event.data === "string") {
+          await this.handleControlMessage(new TextEncoder().encode(event.data));
+          return;
+        }
+
+        const bytes = event.data instanceof ArrayBuffer
+          ? new Uint8Array(event.data)
+          : new Uint8Array(await event.data.arrayBuffer());
+        const packet = parseFramePacket(bytes);
+        await this.handleFramePacket(packet);
+      }
+
+      async handleFramePacket(packet) {
+        this.metrics.datagramsReceived += 1;
+        const { frame, evictedFrames } = this.reassembler.push(packet);
+        if (evictedFrames > 0) {
+          this.metrics.framesDropped += evictedFrames;
+        }
+        if (!frame) {
+          this.updateMetrics();
+          return;
+        }
+
+        await this.decodeFrame(frame);
+      }
+
+      async connect() {
+        if (this.connected) {
+          return;
+        }
+
+        const url = urlInput.value.trim();
+        if (!url) {
+          setStatus("Enter a WebTransport or WebSocket URL before connecting.", true);
+          return;
+        }
+
+        if (!("VideoDecoder" in window)) {
+          setStatus("WebCodecs VideoDecoder is unavailable in this browser.", true);
+          return;
+        }
+
+        if (url.startsWith("ws://") || url.startsWith("wss://")) {
+          await this.connectWebSocket(url);
+          return;
+        }
+
+        if (!("WebTransport" in window)) {
+          setStatus(
+            "WebTransport is unavailable in this browser. Use a ws:// or wss:// URL for fallback.",
+            true
+          );
+          return;
+        }
+
+        const options = {};
+        const certificateHash = certHashInput.value.trim();
+        if (certificateHash) {
+          options.serverCertificateHashes = [{
+            algorithm: "sha-256",
+            value: parseCertificateHash(certificateHash).buffer,
+          }];
+        }
+
+        setStatus("Connecting to WebTransport endpoint...");
+        const transport = new WebTransport(url, options);
+        this.transport = transport;
+        transport.closed
+          .then(() => {
+            if (this.transport === transport) {
+              this.transport = null;
+              this.connected = false;
+              this.resetSessionState("Transport closed.");
+            }
+          })
+          .catch((error) => {
+            if (this.transport === transport) {
+              this.transport = null;
+              this.connected = false;
+              this.resetSessionState(`Transport closed with error: ${formatError(error)}`);
+            }
+          });
+
+        await transport.ready;
+
+        this.datagramReader = transport.datagrams.readable.getReader();
+        this.datagramWriter = transport.datagrams.writable.getWriter();
+        this.controlReader = transport.incomingUnidirectionalStreams.getReader();
+        this.beginConnectedSession(
+          url,
+          "WebTransport",
+          "Connected. Waiting for frame datagrams..."
+        );
+
+        if (codecInput.value.trim()) {
+          await this.applyManualDecoderConfig();
+        }
+
+        this.readDatagrams().catch((error) => {
+          if (this.connected) {
+            setStatus(`Datagram loop ended: ${formatError(error)}`, true);
+          }
+        });
+        this.readControlStreams().catch((error) => {
+          if (this.connected) {
+            setStatus(`Control stream loop ended: ${formatError(error)}`, true);
+          }
+        });
+
+        this.updateMetrics();
+      }
+
+      async disconnect() {
+        this.connected = false;
+
+        if (this.datagramReader) {
+          try {
+            await this.datagramReader.cancel();
+          } catch (_) {}
+          this.datagramReader = null;
+        }
+
+        if (this.controlReader) {
+          try {
+            await this.controlReader.cancel();
+          } catch (_) {}
+          this.controlReader = null;
+        }
+
+        if (this.datagramWriter) {
+          try {
+            this.datagramWriter.releaseLock();
+          } catch (_) {}
+          this.datagramWriter = null;
+        }
+
+        if (this.transport) {
+          try {
+            this.transport.close({ closeCode: 0, reason: "client disconnect" });
+          } catch (_) {}
+          this.transport = null;
+        }
+
+        if (this.ws) {
+          try {
+            this.ws.close(1000, "client disconnect");
+          } catch (_) {}
+          this.ws = null;
+        }
+
+        this.resetSessionState("Disconnected.");
+      }
+
+      async applyManualDecoderConfig() {
+        const config = buildManualDecoderConfig();
+        await this.configureDecoder(config);
+      }
+
+      async configureDecoder(config) {
+        const support = await VideoDecoder.isConfigSupported(config);
+        if (!support.supported) {
+          throw new Error(`Decoder config is not supported: ${JSON.stringify(config)}`);
+        }
+
+        if (!this.decoder) {
+          this.decoder = new VideoDecoder({
+            output: (frame) => this.handleDecodedFrame(frame),
+            error: (error) => {
+              this.metrics.decodeErrors += 1;
+              this.updateMetrics();
+              setStatus(`Decoder error: ${formatError(error)}`, true);
+            },
+          });
+        } else if (this.decoder.state === "configured") {
+          this.decoder.reset();
+        }
+
+        this.pendingDecodes = new Map();
+        this.decoder.configure(support.config);
+        this.decoderConfigured = true;
+        this.decoderConfigKey = JSON.stringify({
+          codec: support.config.codec,
+          codedWidth: support.config.codedWidth || 0,
+          codedHeight: support.config.codedHeight || 0,
+        });
+        this.seenKeyframe = false;
+
+        if (support.config.codedWidth && support.config.codedHeight) {
+          canvas.width = support.config.codedWidth;
+          canvas.height = support.config.codedHeight;
+        }
+
+        setStatus(`Decoder configured for ${support.config.codec}.`);
+        logLine(`Decoder config applied: ${JSON.stringify(config)}`);
+        this.updateMetrics();
+      }
+
+      handleDecodedFrame(frame) {
+        try {
+          if (frame.displayWidth && frame.displayHeight) {
+            if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+              canvas.width = frame.displayWidth;
+              canvas.height = frame.displayHeight;
+            }
+          }
+
+          const decodeStartedAt = this.pendingDecodes.get(frame.timestamp);
+          if (decodeStartedAt != null) {
+            this.pendingDecodes.delete(frame.timestamp);
+            const decodeMs = performance.now() - decodeStartedAt;
+            this.metrics.lastDecodeMs = decodeMs;
+            this.metrics.decodeSampleCount += 1;
+            this.metrics.totalDecodeMs += decodeMs;
+            this.metrics.averageDecodeMs =
+              this.metrics.totalDecodeMs / this.metrics.decodeSampleCount;
+          }
+
+          ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+          this.metrics.framesDecoded += 1;
+          this.metrics.lastFrameMs = performance.now();
+          this.updateMetrics();
+        } finally {
+          frame.close();
+        }
+      }
+
+      async readDatagrams() {
+        while (this.connected && this.datagramReader) {
+          const { value, done } = await this.datagramReader.read();
+          if (done || !value) {
+            break;
+          }
+
+          const packet = parseFramePacket(value);
+          await this.handleFramePacket(packet);
+        }
+      }
+
+      async decodeFrame(frame) {
+        if (!this.decoderConfigured || !this.decoder) {
+          this.metrics.framesDropped += 1;
+          this.updateMetrics();
+          return;
+        }
+
+        if (!this.seenKeyframe && !frame.isKeyframe) {
+          this.metrics.framesDropped += 1;
+          this.updateMetrics();
+          return;
+        }
+
+        this.seenKeyframe = this.seenKeyframe || frame.isKeyframe;
+        this.metrics.lastFrameType = frame.isLossless
+          ? "refine"
+          : (frame.isKeyframe ? "key" : "delta");
+
+        const chunk = new EncodedVideoChunk({
+          type: frame.isKeyframe ? "key" : "delta",
+          timestamp: frame.timestampUs,
+          data: frame.data,
+        });
+
+        try {
+          this.pendingDecodes.set(frame.timestampUs, performance.now());
+          this.decoder.decode(chunk);
+          this.metrics.framesSubmitted += 1;
+          this.updateMetrics();
+        } catch (error) {
+          this.pendingDecodes.delete(frame.timestampUs);
+          this.metrics.decodeErrors += 1;
+          this.metrics.framesDropped += 1;
+          this.updateMetrics();
+          setStatus(`Decoder rejected frame: ${formatError(error)}`, true);
+        }
+      }
+
+      async readControlStreams() {
+        while (this.connected && this.controlReader) {
+          const { value, done } = await this.controlReader.read();
+          if (done || !value) {
+            break;
+          }
+
+          const bytes = await readReadableStream(value);
+          await this.handleControlMessage(bytes);
+        }
+      }
+
+      async handleControlMessage(bytes) {
+        const text = new TextDecoder().decode(bytes);
+
+        try {
+          const message = JSON.parse(text);
+          this.metrics.lastControlMessage = summarizeControlMessage(message);
+          this.updateMetrics();
+          if (message.type === DECODER_CONFIG_CONTROL) {
+            const config = decoderConfigFromControlMessage(message);
+            await this.configureDecoder(config);
+            setStatus(`Applied decoder config from control stream (${config.codec}).`);
+          } else if (message.type === SESSION_METRICS_CONTROL) {
+            this.applySessionMetrics(message);
+          } else if (message.type === "status" && message.message) {
+            setStatus(message.message);
+          } else {
+            logLine(`Control: ${text}`);
+          }
+        } catch (_) {
+          this.metrics.lastControlMessage = truncateForHud(text, 32);
+          this.updateMetrics();
+          logLine(`Control: ${text}`);
+        }
+      }
+
+      applySessionMetrics(message) {
+        if (typeof message.encodeTimeUs === "number") {
+          this.metrics.encodeTimeUs = message.encodeTimeUs;
+        }
+        if (typeof message.transportRttMs === "number") {
+          this.metrics.transportRttMs = message.transportRttMs;
+        }
+        this.updateMetrics();
+      }
+
+      sendUnreliable(bytes) {
+        if (!this.connected) {
+          return;
+        }
+
+        if (this.ws) {
+          try {
+            this.ws.send(bytes);
+          } catch (error) {
+            setStatus(`Failed to send WebSocket input: ${formatError(error)}`, true);
+            return;
+          }
+          this.metrics.unreliableInputSent += 1;
+          this.updateMetrics();
+          return;
+        }
+
+        if (!this.datagramWriter) {
+          return;
+        }
+
+        this.datagramWriter.write(bytes).catch((error) => {
+          setStatus(`Failed to send datagram input: ${formatError(error)}`, true);
+        });
+        this.metrics.unreliableInputSent += 1;
+        this.updateMetrics();
+      }
+
+      async sendReliable(bytes) {
+        if (!this.connected) {
+          return;
+        }
+
+        if (this.ws) {
+          try {
+            this.ws.send(bytes);
+          } catch (error) {
+            setStatus(`Failed to send WebSocket input: ${formatError(error)}`, true);
+            return;
+          }
+          this.metrics.reliableInputSent += 1;
+          this.updateMetrics();
+          return;
+        }
+
+        if (!this.transport) {
+          return;
+        }
+
+        try {
+          const stream = await this.transport.createUnidirectionalStream();
+          const writer = stream.getWriter();
+          await writer.write(bytes);
+          await writer.close();
+          writer.releaseLock();
+          this.metrics.reliableInputSent += 1;
+          this.updateMetrics();
+        } catch (error) {
+          setStatus(`Failed to send reliable input: ${formatError(error)}`, true);
+        }
+      }
+
+      updateMetrics() {
+        const lastFrame = this.metrics.lastFrameMs == null
+          ? "never"
+          : `${(performance.now() - this.metrics.lastFrameMs).toFixed(1)} ms ago`;
+        const lastDecode = this.metrics.lastDecodeMs == null
+          ? "n/a"
+          : `${this.metrics.lastDecodeMs.toFixed(2)} ms`;
+        const averageDecode = this.metrics.averageDecodeMs == null
+          ? "n/a"
+          : `${this.metrics.averageDecodeMs.toFixed(2)} ms`;
+        const encodeTime = this.metrics.encodeTimeUs == null
+          ? "n/a"
+          : `${(this.metrics.encodeTimeUs / 1000).toFixed(2)} ms`;
+        const transportRtt = this.metrics.transportRttMs == null
+          ? "n/a"
+          : `${this.metrics.transportRttMs.toFixed(2)} ms`;
+        const decoderState = this.decoder ? this.decoder.state : "none";
+
+        metricsElement.textContent = [
+          `mode:           ${this.connectionMode}`,
+          `decoder:        ${decoderState}`,
+          `transport RTT:  ${transportRtt}`,
+          `encode time:    ${encodeTime}`,
+          `decode last:    ${lastDecode}`,
+          `decode avg:     ${averageDecode}`,
+          `datagrams:      ${this.metrics.datagramsReceived}`,
+          `frames submit:  ${this.metrics.framesSubmitted}`,
+          `frames decode:  ${this.metrics.framesDecoded}`,
+          `frames dropped: ${this.metrics.framesDropped}`,
+          `decode errors:  ${this.metrics.decodeErrors}`,
+          `input dg:       ${this.metrics.unreliableInputSent}`,
+          `input reliable: ${this.metrics.reliableInputSent}`,
+          `last type:      ${this.metrics.lastFrameType}`,
+          `last control:   ${this.metrics.lastControlMessage}`,
+          `last frame:     ${lastFrame}`,
+        ].join("\n");
+      }
+    }
+
+    const client = new UltraStreamerClient();
+    client.updateMetrics();
+
+    canvas.addEventListener("pointermove", (event) => {
+      if (!client.connected) {
+        return;
+      }
+
+      const { x, y } = normalizedPointerPosition(event, canvas);
+      const buffer = new ArrayBuffer(14);
+      const view = new DataView(buffer);
+      view.setUint8(0, INPUT_POINTER_MOVE);
+      view.setUint8(1, event.buttons & 0xff);
+      view.setFloat32(2, x, true);
+      view.setFloat32(6, y, true);
+      view.setUint32(10, Math.floor(performance.now()), true);
+      client.sendUnreliable(new Uint8Array(buffer));
+    });
+
+    canvas.addEventListener("pointerdown", (event) => {
+      canvas.focus();
+      canvas.setPointerCapture(event.pointerId);
+      const { x, y } = normalizedPointerPosition(event, canvas);
+      void client.sendReliable(encodePointerButton(INPUT_POINTER_DOWN, event.button, x, y));
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      const { x, y } = normalizedPointerPosition(event, canvas);
+      void client.sendReliable(encodePointerButton(INPUT_POINTER_UP, event.button, x, y));
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+    });
+
+    canvas.addEventListener("wheel", (event) => {
+      if (!client.connected) {
+        return;
+      }
+
+      event.preventDefault();
+      const buffer = new ArrayBuffer(10);
+      const view = new DataView(buffer);
+      view.setUint8(0, INPUT_SCROLL);
+      view.setFloat32(1, event.deltaX, true);
+      view.setFloat32(5, event.deltaY, true);
+      view.setUint8(9, event.deltaMode & 0xff);
+      client.sendUnreliable(new Uint8Array(buffer));
+    }, { passive: false });
+
+    canvas.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (document.activeElement !== canvas) {
+        return;
+      }
+
+      const keyCode = encodeDomKeyCode(event);
+      if (keyCode === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      void client.sendReliable(encodeKeyEvent(INPUT_KEY_DOWN, keyCode));
+    });
+
+    document.addEventListener("keyup", (event) => {
+      if (document.activeElement !== canvas) {
+        return;
+      }
+
+      const keyCode = encodeDomKeyCode(event);
+      if (keyCode === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      void client.sendReliable(encodeKeyEvent(INPUT_KEY_UP, keyCode));
+    });
+
+    connectButton.addEventListener("click", () => {
+      client.connect().catch((error) => {
+        setStatus(`Connect failed: ${formatError(error)}`, true);
+        updateButtons(false);
+      });
+    });
+
+    disconnectButton.addEventListener("click", () => {
+      client.disconnect().catch((error) => {
+        setStatus(`Disconnect failed: ${formatError(error)}`, true);
+      });
+    });
+
+    applyDecoderButton.addEventListener("click", () => {
+      client.applyManualDecoderConfig().catch((error) => {
+        setStatus(`Decoder config failed: ${formatError(error)}`, true);
+      });
+    });
+
+    function defaultTransportUrl() {
+      const host = window.location.hostname || "127.0.0.1";
+      if (window.location.protocol === "http:" || window.location.protocol === "file:") {
+        return `ws://${host}:8080/stream`;
+      }
+      return `https://${host}:4433/stream`;
+    }
+
+    function setStatus(message, isError = false) {
+      statusElement.textContent = message;
+      statusElement.classList.toggle("error", isError);
+    }
+
+    function logLine(message) {
+      const timestamp = new Date().toLocaleTimeString();
+      logElement.textContent = `${timestamp}  ${message}\n${logElement.textContent}`.trim();
+    }
+
+    function updateButtons(connected) {
+      connectButton.disabled = connected;
+      disconnectButton.disabled = !connected;
+    }
+
+    function normalizedPointerPosition(event, element) {
+      const rect = element.getBoundingClientRect();
+      const x = clamp01((event.clientX - rect.left) / Math.max(rect.width, 1));
+      const y = clamp01((event.clientY - rect.top) / Math.max(rect.height, 1));
+      return { x, y };
+    }
+
+    function clamp01(value) {
+      return Math.min(1, Math.max(0, value));
+    }
+
+    function parseFramePacket(bytesLike) {
+      const bytes = bytesLike instanceof Uint8Array ? bytesLike : new Uint8Array(bytesLike);
+      if (bytes.byteLength < FRAME_PACKET_HEADER_SIZE) {
+        throw new Error(`Frame packet too short: ${bytes.byteLength} bytes`);
+      }
+
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      return {
+        frameId: view.getUint32(0, true),
+        fragmentIdx: view.getUint16(4, true),
+        fragmentCount: view.getUint16(6, true),
+        timestampUs: Number(view.getBigUint64(8, true)),
+        isKeyframe: (view.getUint8(16) & 0x01) !== 0,
+        isLossless: (view.getUint8(16) & 0x02) !== 0,
+        payload: new Uint8Array(
+          bytes.buffer,
+          bytes.byteOffset + FRAME_PACKET_HEADER_SIZE,
+          bytes.byteLength - FRAME_PACKET_HEADER_SIZE,
+        ),
+      };
+    }
+
+    function parseCertificateHash(hashString) {
+      const normalized = hashString.replace(/[^0-9a-f]/gi, "").toLowerCase();
+      if (normalized.length !== 64) {
+        throw new Error("Certificate hash must contain exactly 32 bytes (64 hex chars).");
+      }
+
+      const bytes = new Uint8Array(32);
+      for (let index = 0; index < normalized.length; index += 2) {
+        bytes[index / 2] = Number.parseInt(normalized.slice(index, index + 2), 16);
+      }
+      return bytes;
+    }
+
+    function buildManualDecoderConfig() {
+      const codec = codecInput.value.trim();
+      if (!codec) {
+        throw new Error("Enter a codec string before configuring the decoder.");
+      }
+
+      const config = {
+        codec,
+        hardwareAcceleration: "prefer-hardware",
+        optimizeForLatency: true,
+      };
+
+      const descriptionBase64 = descriptionInput.value.trim();
+      if (descriptionBase64) {
+        config.description = base64ToUint8Array(descriptionBase64);
+      }
+
+      return config;
+    }
+
+    function createEmptyMetrics() {
+      return {
+        datagramsReceived: 0,
+        framesSubmitted: 0,
+        framesDecoded: 0,
+        framesDropped: 0,
+        decodeErrors: 0,
+        reliableInputSent: 0,
+        unreliableInputSent: 0,
+        lastFrameMs: null,
+        lastFrameType: "none",
+        lastControlMessage: "none",
+        lastDecodeMs: null,
+        averageDecodeMs: null,
+        decodeSampleCount: 0,
+        totalDecodeMs: 0,
+        encodeTimeUs: null,
+        transportRttMs: null,
+      };
+    }
+
+    function summarizeControlMessage(message) {
+      if (!message || typeof message.type !== "string") {
+        return "json";
+      }
+
+      if (message.type === DECODER_CONFIG_CONTROL) {
+        return message.codec ? `decoder-config ${message.codec}` : DECODER_CONFIG_CONTROL;
+      }
+
+      if (message.type === SESSION_METRICS_CONTROL) {
+        return SESSION_METRICS_CONTROL;
+      }
+
+      if (message.type === "status") {
+        return message.message
+          ? `status ${truncateForHud(message.message, 28)}`
+          : "status";
+      }
+
+      return truncateForHud(message.type, 32);
+    }
+
+    function truncateForHud(value, maxLength) {
+      if (value.length <= maxLength) {
+        return value;
+      }
+
+      return `${value.slice(0, Math.max(0, maxLength - 1))}…`;
+    }
+
+    function decoderConfigFromControlMessage(message) {
+      const config = {
+        codec: message.codec,
+        hardwareAcceleration: message.hardwareAcceleration || "prefer-hardware",
+        optimizeForLatency: message.optimizeForLatency !== false,
+      };
+
+      if (typeof message.codedWidth === "number") {
+        config.codedWidth = message.codedWidth;
+      }
+      if (typeof message.codedHeight === "number") {
+        config.codedHeight = message.codedHeight;
+      }
+      if (message.descriptionBase64) {
+        config.description = base64ToUint8Array(message.descriptionBase64);
+      }
+
+      return config;
+    }
+
+    function base64ToUint8Array(value) {
+      const binary = atob(value.replace(/\s+/g, ""));
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return bytes;
+    }
+
+    async function readReadableStream(stream) {
+      const reader = stream.getReader();
+      const chunks = [];
+      let totalLength = 0;
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+        chunks.push(chunk);
+        totalLength += chunk.byteLength;
+      }
+
+      const bytes = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+
+      return bytes;
+    }
+
+    function encodePointerButton(tag, button, x, y) {
+      const buffer = new ArrayBuffer(10);
+      const view = new DataView(buffer);
+      view.setUint8(0, tag);
+      view.setUint8(1, button & 0xff);
+      view.setFloat32(2, x, true);
+      view.setFloat32(6, y, true);
+      return new Uint8Array(buffer);
+    }
+
+    function encodeKeyEvent(tag, code) {
+      return new Uint8Array([tag, (code >> 8) & 0xff, code & 0xff]);
+    }
+
+    function encodeDomKeyCode(event) {
+      if (keyCodeMap.has(event.code)) {
+        return keyCodeMap.get(event.code);
+      }
+
+      if (event.code.startsWith("Key") && event.code.length === 4) {
+        return event.code.charCodeAt(3);
+      }
+
+      if (event.code.startsWith("Digit") && event.code.length === 6) {
+        return event.code.charCodeAt(5);
+      }
+
+      if (typeof event.key === "string" && event.key.length === 1) {
+        return event.key.toUpperCase().charCodeAt(0);
+      }
+
+      if (typeof event.keyCode === "number" && event.keyCode > 0) {
+        return event.keyCode;
+      }
+
+      return 0;
+    }
+
+    function formatError(error) {
+      if (error instanceof Error) {
+        return error.message;
+      }
+      return String(error);
+    }
+
+    client.updateMetrics();
   </script>
 </body>
 </html>

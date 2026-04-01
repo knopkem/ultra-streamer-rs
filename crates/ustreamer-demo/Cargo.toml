@@ -1,0 +1,19 @@
+[package]
+name = "ustreamer-demo"
+description = "Headless live-test demo for ultra-streamer-rs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bytemuck = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wgpu = { workspace = true }
+ustreamer-capture = { workspace = true }
+ustreamer-encode = { workspace = true }
+ustreamer-input = { workspace = true }
+ustreamer-proto = { workspace = true }
+ustreamer-quality = { workspace = true }
+ustreamer-transport = { workspace = true }

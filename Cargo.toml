@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ustreamer-capture",
+    "crates/ustreamer-demo",
     "crates/ustreamer-encode",
     "crates/ustreamer-transport",
     "crates/ustreamer-input",
@@ -25,6 +26,7 @@ bytes = "1"
 
 # QUIC / WebTransport
 quinn = "0.11"
+wtransport = "0.7"
 
 # Logging
 tracing = "0.1"
