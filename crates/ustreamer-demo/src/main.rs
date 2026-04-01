@@ -170,6 +170,7 @@ mod macos_demo {
                 frame_id,
                 timestamp_us,
                 encoded_frame.is_keyframe,
+                encoded_frame.is_refine,
                 encoded_frame.is_lossless,
                 &encoded_frame.data,
             );

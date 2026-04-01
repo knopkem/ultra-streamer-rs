@@ -228,6 +228,7 @@ mod tests {
             fragment_count: 1,
             timestamp_us: 999,
             is_keyframe: true,
+            is_refine: true,
             is_lossless: true,
             payload: vec![1, 2, 3, 4],
         };
@@ -244,6 +245,7 @@ mod tests {
         let decoded = FramePacket::from_bytes(&bytes)?;
         assert_eq!(decoded.frame_id, 7);
         assert!(decoded.is_keyframe);
+        assert!(decoded.is_refine);
         assert!(decoded.is_lossless);
 
         Ok(())

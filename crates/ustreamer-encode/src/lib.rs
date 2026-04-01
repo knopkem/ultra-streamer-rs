@@ -21,6 +21,8 @@ pub struct EncodedFrame {
     pub data: Vec<u8>,
     /// Whether this is a keyframe.
     pub is_keyframe: bool,
+    /// Whether this frame is a settle/refine frame.
+    pub is_refine: bool,
     /// Whether this frame was encoded losslessly.
     pub is_lossless: bool,
     /// Encode duration in microseconds.

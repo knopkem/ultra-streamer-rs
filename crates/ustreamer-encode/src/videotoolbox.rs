@@ -87,6 +87,7 @@ struct PendingEncode {
     sender: SyncSender<Result<CallbackResult, String>>,
     started_at: Instant,
     fallback_keyframe: bool,
+    fallback_refine: bool,
     fallback_lossless: bool,
 }
 
@@ -211,7 +212,8 @@ impl VideoToolboxEncoder {
                 sender: tx,
                 started_at: Instant::now(),
                 fallback_keyframe: force_keyframe,
-                fallback_lossless: matches!(params.mode, EncodeMode::LosslessRefine),
+                fallback_refine: matches!(params.mode, EncodeMode::LosslessRefine),
+                fallback_lossless: false,
             });
         }
 
@@ -706,6 +708,7 @@ unsafe extern "C-unwind" fn videotoolbox_output_callback(
         sample,
         pending.started_at,
         pending.fallback_keyframe,
+        pending.fallback_refine,
         pending.fallback_lossless,
     );
     let _ = pending.sender.send(result);
@@ -715,6 +718,7 @@ fn sample_buffer_to_result(
     sample: &CMSampleBuffer,
     started_at: Instant,
     fallback_keyframe: bool,
+    fallback_refine: bool,
     fallback_lossless: bool,
 ) -> Result<CallbackResult, String> {
     let data_buffer = unsafe { sample.data_buffer() }
@@ -729,7 +733,8 @@ fn sample_buffer_to_result(
         frame: EncodedFrame {
             data,
             is_keyframe,
-            is_lossless: false && fallback_lossless,
+            is_refine: fallback_refine,
+            is_lossless: fallback_lossless,
             encode_time_us: started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
         },
         decoder_config,

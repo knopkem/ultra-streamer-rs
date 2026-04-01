@@ -325,6 +325,7 @@
             receivedCount: 0,
             timestampUs: packet.timestampUs,
             isKeyframe: packet.isKeyframe,
+            isRefine: packet.isRefine,
             isLossless: packet.isLossless,
           };
           this.frames.set(packet.frameId, entry);
@@ -358,6 +359,7 @@
             frameId: entry.frameId,
             timestampUs: entry.timestampUs,
             isKeyframe: entry.isKeyframe,
+            isRefine: entry.isRefine,
             isLossless: entry.isLossless,
             data,
           },
@@ -753,8 +755,8 @@
 
         this.seenKeyframe = this.seenKeyframe || frame.isKeyframe;
         this.metrics.lastFrameType = frame.isLossless
-          ? "refine"
-          : (frame.isKeyframe ? "key" : "delta");
+          ? "lossless-refine"
+          : (frame.isRefine ? "refine" : (frame.isKeyframe ? "key" : "delta"));
 
         const chunk = new EncodedVideoChunk({
           type: frame.isKeyframe ? "key" : "delta",
@@ -1071,6 +1073,7 @@
         fragmentCount: view.getUint16(6, true),
         timestampUs: Number(view.getBigUint64(8, true)),
         isKeyframe: (view.getUint8(16) & 0x01) !== 0,
+        isRefine: (view.getUint8(17) & 0x01) !== 0,
         isLossless: (view.getUint8(16) & 0x02) !== 0,
         payload: new Uint8Array(
           bytes.buffer,

@@ -45,6 +45,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **WebSocket fallback transport** for browsers or environments without WebTransport
 - **Settle refinement groundwork** — quality-controller mode switching and forced keyframes on idle refine
 - **Adaptive quality** — requested tier capped by RTT/loss feedback with upgrade/downgrade hysteresis
+- **Settle/refine propagation** — idle settle forces a higher-bitrate keyframe refine with explicit `refine` vs `lossless` signaling
 - **Compact binary input protocol** — sub-millisecond input event delivery
 - **Typed control protocol** — shared decoder-config / status / session-metrics JSON messages
 - **Browser metrics HUD** — decode timing, frame drops, connection mode, and server-fed RTT/encode telemetry
@@ -67,6 +68,9 @@ The demo currently exercises:
 - VideoToolbox HEVC encode
 - WebSocket browser transport
 - WebCodecs decode and interactive input round-trip
+- settle/refine frame signaling in the browser HUD
+
+On macOS, VideoToolbox HEVC refine frames are currently **high-bitrate visually-lossless settle frames**, not bit-exact lossless frames. The protocol now distinguishes generic `refine` frames from true `lossless-refine` frames so future NVENC/software backends can advertise real lossless output honestly.
 
 Demo controls:
 

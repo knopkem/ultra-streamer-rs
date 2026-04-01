@@ -11,6 +11,8 @@ pub struct FramePacket {
     pub timestamp_us: u64,
     /// Whether this is a keyframe (IDR).
     pub is_keyframe: bool,
+    /// Whether this frame is a single-frame refine/settle update.
+    pub is_refine: bool,
     /// Whether this frame is lossless (diagnostic refinement).
     pub is_lossless: bool,
     /// Encoded NALU fragment payload.
@@ -33,7 +35,7 @@ impl FramePacket {
     /// [6..8]   fragment_count: u16 LE
     /// [8..16]  timestamp_us: u64 LE
     /// [16]     flags: u8 (bit 0 = keyframe, bit 1 = lossless)
-    /// [17]     reserved: u8
+    /// [17]     metadata flags: u8 (bit 0 = refine)
     /// [18..]   payload
     /// ```
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -43,8 +45,9 @@ impl FramePacket {
         buf.extend_from_slice(&self.fragment_count.to_le_bytes());
         buf.extend_from_slice(&self.timestamp_us.to_le_bytes());
         let flags = (self.is_keyframe as u8) | ((self.is_lossless as u8) << 1);
+        let metadata_flags = self.is_refine as u8;
         buf.push(flags);
-        buf.push(0); // reserved
+        buf.push(metadata_flags);
         buf.extend_from_slice(&self.payload);
         buf
     }
@@ -63,6 +66,7 @@ impl FramePacket {
         let fragment_count = u16::from_le_bytes(data[6..8].try_into().unwrap());
         let timestamp_us = u64::from_le_bytes(data[8..16].try_into().unwrap());
         let flags = data[16];
+        let metadata_flags = data[17];
 
         Ok(Self {
             frame_id,
@@ -70,6 +74,7 @@ impl FramePacket {
             fragment_count,
             timestamp_us,
             is_keyframe: flags & 0x01 != 0,
+            is_refine: metadata_flags & 0x01 != 0,
             is_lossless: flags & 0x02 != 0,
             payload: data[FRAME_PACKET_HEADER_SIZE..].to_vec(),
         })
@@ -87,6 +92,7 @@ pub fn packetize_frame(
     frame_id: u32,
     timestamp_us: u64,
     is_keyframe: bool,
+    is_refine: bool,
     is_lossless: bool,
     nalu_data: &[u8],
 ) -> Vec<FramePacket> {
@@ -102,6 +108,7 @@ pub fn packetize_frame(
             fragment_count,
             timestamp_us,
             is_keyframe,
+            is_refine,
             is_lossless,
             payload: chunk.to_vec(),
         })
@@ -120,6 +127,7 @@ mod tests {
             fragment_count: 3,
             timestamp_us: 123456789,
             is_keyframe: true,
+            is_refine: true,
             is_lossless: false,
             payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
         };
@@ -132,6 +140,7 @@ mod tests {
         assert_eq!(decoded.fragment_count, 3);
         assert_eq!(decoded.timestamp_us, 123456789);
         assert!(decoded.is_keyframe);
+        assert!(decoded.is_refine);
         assert!(!decoded.is_lossless);
         assert_eq!(decoded.payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
     }
@@ -139,7 +148,7 @@ mod tests {
     #[test]
     fn packetize_splits_correctly() {
         let data = vec![0u8; MAX_DATAGRAM_PAYLOAD * 2 + 100];
-        let packets = packetize_frame(1, 0, true, false, &data);
+        let packets = packetize_frame(1, 0, true, false, false, &data);
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].fragment_count, 3);
         assert_eq!(packets[0].fragment_idx, 0);

@@ -435,6 +435,7 @@ mod tests {
             fragment_count: 1,
             timestamp_us: 123_456,
             is_keyframe: true,
+            is_refine: false,
             is_lossless: false,
             payload: vec![1, 2, 3, 4, 5],
         };
@@ -453,6 +454,7 @@ mod tests {
         assert_eq!(decoded.fragment_count, 1);
         assert_eq!(decoded.timestamp_us, 123_456);
         assert!(decoded.is_keyframe);
+        assert!(!decoded.is_refine);
         assert!(!decoded.is_lossless);
         assert_eq!(decoded.payload, vec![1, 2, 3, 4, 5]);
 

@@ -22,10 +22,11 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** macOS zero-copy Metal/IOSurface capture and direct VideoToolbox HEVC encode backend with WebCodecs-ready `hvcC` extraction
 - **Implemented:** CPU/staging-backed VideoToolbox input path for headless smoke testing and fallback encode
 - **Implemented:** adaptive quality tier capping from RTT/loss samples with recovery/degrade hysteresis
+- **Implemented:** settle/refine propagation with explicit `refine` vs `lossless` frame metadata and higher-bitrate settle keyframes
 - **Implemented:** WebSocket fallback server/session path with browser fallback wiring
 - **Implemented:** typed control-message protocol plus browser metrics dashboard hooks for decode time, frame drops, encode time, and RTT
 - **Implemented:** headless live-test server (`cargo run -p ustreamer-demo`) serving the browser client and streaming an offscreen `wgpu` scene over WebSocket
-- **Next up:** lossless diagnostic settle propagation and the NVIDIA zero-copy/NVENC path
+- **Next up:** the NVIDIA zero-copy/NVENC path and backend-specific true-lossless refine where supported
 
 ---
 
@@ -694,7 +695,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 ### Phase 2: NVIDIA + Quality + Lossless
 - **capture-nvenc-zerocopy**: wgpu-hal Vulkan texture → VkImage export → CUDA external memory import → NVENC register resource
 - **encoder-nvenc-direct**: Direct NVENC encoder via nvidia-video-codec-rs — H.265/AV1, ultra-low-latency tuning
-- **lossless-settle**: Idle detection (150–300ms) → switch encoder to lossless QP=0 → send I-frame → browser replaces canvas
+- **lossless-settle** *(done)*: Idle detection → forced high-bitrate refine keyframe, explicit `refine` vs `lossless` signaling on the wire; VideoToolbox remains visually-lossless only, while future backends can mark true lossless frames
 - **lossless-checksum**: Server computes frame hash, sends with lossless frame, browser verifies pixel-perfect delivery
 - **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle
 - **browser-overlay-hybrid**: Move toolbars/metadata/annotations to native HTML/SVG overlay, reducing encoded viewport

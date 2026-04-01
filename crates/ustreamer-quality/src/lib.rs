@@ -183,11 +183,19 @@ impl QualityController {
             EncodeMode::Interactive
         };
 
-        let (width, height, fps, bitrate, max_bitrate) = match self.current_tier() {
+        let (width, height, fps, bitrate, max_bitrate): (u32, u32, u32, u64, u64) =
+            match self.current_tier() {
             QualityTier::Low => (1280, 720, 30, 5_000_000, 10_000_000),
             QualityTier::Standard => (1920, 1080, 60, 15_000_000, 30_000_000),
             QualityTier::HighRes => (3840, 2160, 30, 40_000_000, 80_000_000),
             QualityTier::Ultra => (3840, 2160, 60, 80_000_000, 150_000_000),
+        };
+        let (bitrate, max_bitrate) = match mode {
+            EncodeMode::LosslessRefine => (
+                max_bitrate,
+                max_bitrate.saturating_mul(2),
+            ),
+            _ => (bitrate, max_bitrate),
         };
 
         let target_fps = match mode {
@@ -329,6 +337,8 @@ mod tests {
         let refine = controller.frame_params();
         assert_eq!(refine.mode, EncodeMode::LosslessRefine);
         assert!(refine.force_keyframe);
+        assert_eq!(refine.bitrate_bps, 30_000_000);
+        assert_eq!(refine.max_bitrate_bps, 60_000_000);
 
         let idle = controller.frame_params();
         assert_eq!(idle.mode, EncodeMode::Interactive);
