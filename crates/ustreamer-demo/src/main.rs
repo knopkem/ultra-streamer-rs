@@ -35,7 +35,9 @@ mod macos_demo {
     use ustreamer_capture::{FrameCapture, staging::StagingCapture};
     use ustreamer_encode::{FrameEncoder, videotoolbox::VideoToolboxEncoder};
     use ustreamer_input::{AppAction, InputMapper, InteractionMode};
-    use ustreamer_proto::control::{ControlMessage, SessionMetricsMessage, StatusMessage};
+    use ustreamer_proto::control::{
+        ControlMessage, FrameChecksumMessage, SessionMetricsMessage, StatusMessage,
+    };
     use ustreamer_proto::frame::packetize_frame;
     use ustreamer_proto::input::InputEvent;
     use ustreamer_proto::quality::QualityTier;
@@ -114,6 +116,9 @@ mod macos_demo {
             let captured_frame = capture
                 .capture(renderer.device(), renderer.queue(), renderer.texture())
                 .context("failed to capture rendered frame")?;
+            let frame_checksum = captured_frame
+                .diagnostic_checksum()
+                .context("failed to compute diagnostic checksum")?;
             let encoded_frame = encoder
                 .encode(&captured_frame, &params)
                 .context("failed to encode captured frame")?;
@@ -166,8 +171,9 @@ mod macos_demo {
             }
 
             let timestamp_us = start_time.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let current_frame_id = frame_id;
             let packets = packetize_frame(
-                frame_id,
+                current_frame_id,
                 timestamp_us,
                 encoded_frame.is_keyframe,
                 encoded_frame.is_refine,
@@ -176,9 +182,26 @@ mod macos_demo {
             );
             frame_id = frame_id.wrapping_add(1);
 
-            let mut control_messages = Vec::new();
+            let mut pre_frame_control_messages = Vec::new();
+            if encoded_frame.is_refine || encoded_frame.is_lossless {
+                if let Some(checksum) = frame_checksum {
+                    pre_frame_control_messages.push(
+                        ControlMessage::FrameChecksum(
+                            FrameChecksumMessage::rgba8_fnv1a64(
+                                current_frame_id,
+                                checksum.hex_string(),
+                            )
+                            .with_dimensions(checksum.width, checksum.height),
+                        )
+                        .to_bytes()
+                        .context("failed to serialize frame checksum")?,
+                    );
+                }
+            }
+
+            let mut post_frame_control_messages = Vec::new();
             if last_metrics_sent.elapsed() >= METRICS_INTERVAL {
-                control_messages.push(
+                post_frame_control_messages.push(
                     ControlMessage::SessionMetrics(
                         SessionMetricsMessage::new()
                             .with_encode_time_us(encoded_frame.encode_time_us),
@@ -191,11 +214,17 @@ mod macos_demo {
 
             let session_clone = session.session.clone();
             let send_result: Result<()> = runtime.block_on(async {
+                for message in &pre_frame_control_messages {
+                    session_clone
+                        .send_control_message(message)
+                        .await
+                        .context("failed to send pre-frame control message")?;
+                }
                 session_clone
                     .send_frame_packets(&packets)
                     .await
                     .context("failed to send frame packets")?;
-                for message in &control_messages {
+                for message in &post_frame_control_messages {
                     session_clone
                         .send_control_message(message)
                         .await

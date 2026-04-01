@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ControlMessage {
     DecoderConfig(DecoderConfigMessage),
+    FrameChecksum(FrameChecksumMessage),
     Status(StatusMessage),
     SessionMetrics(SessionMetricsMessage),
 }
@@ -67,6 +68,38 @@ impl DecoderConfigMessage {
     /// Attach codec-specific description bytes, serialized as base64 in JSON.
     pub fn with_description(mut self, description: Vec<u8>) -> Self {
         self.description = Some(description);
+        self
+    }
+}
+
+/// Diagnostic frame checksum sent alongside refine/lossless frames.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameChecksumMessage {
+    #[serde(rename = "frameId")]
+    pub frame_id: u32,
+    pub algorithm: String,
+    #[serde(rename = "hashHex")]
+    pub hash_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl FrameChecksumMessage {
+    pub fn rgba8_fnv1a64(frame_id: u32, hash_hex: impl Into<String>) -> Self {
+        Self {
+            frame_id,
+            algorithm: "fnv1a64-rgba8".to_owned(),
+            hash_hex: hash_hex.into(),
+            width: None,
+            height: None,
+        }
+    }
+
+    pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.width = Some(width);
+        self.height = Some(height);
         self
     }
 }
@@ -142,7 +175,8 @@ mod optional_base64_bytes {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlMessage, DecoderConfigMessage, SessionMetricsMessage, StatusMessage,
+        ControlMessage, DecoderConfigMessage, FrameChecksumMessage, SessionMetricsMessage,
+        StatusMessage,
     };
 
     #[test]
@@ -178,6 +212,25 @@ mod tests {
         assert!(json.contains("\"type\":\"session-metrics\""));
         assert!(json.contains("\"encodeTimeUs\":1750"));
         assert!(json.contains("\"transportRttMs\":2.5"));
+    }
+
+    #[test]
+    fn serializes_frame_checksum_message() {
+        let message = ControlMessage::FrameChecksum(
+            FrameChecksumMessage::rgba8_fnv1a64(7, "0123456789abcdef").with_dimensions(1920, 1080),
+        );
+
+        let bytes = message.to_bytes().unwrap();
+        let json = String::from_utf8(bytes.clone()).unwrap();
+        assert!(json.contains("\"type\":\"frame-checksum\""));
+        assert!(json.contains("\"frameId\":7"));
+        assert!(json.contains("\"algorithm\":\"fnv1a64-rgba8\""));
+        assert!(json.contains("\"hashHex\":\"0123456789abcdef\""));
+        assert!(json.contains("\"width\":1920"));
+        assert!(json.contains("\"height\":1080"));
+
+        let decoded = ControlMessage::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]

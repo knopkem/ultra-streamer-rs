@@ -25,6 +25,7 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** settle/refine propagation with explicit `refine` vs `lossless` frame metadata and higher-bitrate settle keyframes
 - **Implemented:** WebSocket fallback server/session path with browser fallback wiring
 - **Implemented:** typed control-message protocol plus browser metrics dashboard hooks for decode time, frame drops, encode time, and RTT
+- **Implemented:** diagnostic frame checksums over staged CPU frames with browser-side verification HUD plumbing for refine/lossless updates
 - **Implemented:** headless live-test server (`cargo run -p ustreamer-demo`) serving the browser client and streaming an offscreen `wgpu` scene over WebSocket
 - **Next up:** the NVIDIA zero-copy/NVENC path and backend-specific true-lossless refine where supported
 
@@ -696,7 +697,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **capture-nvenc-zerocopy**: wgpu-hal Vulkan texture → VkImage export → CUDA external memory import → NVENC register resource
 - **encoder-nvenc-direct**: Direct NVENC encoder via nvidia-video-codec-rs — H.265/AV1, ultra-low-latency tuning
 - **lossless-settle** *(done)*: Idle detection → forced high-bitrate refine keyframe, explicit `refine` vs `lossless` signaling on the wire; VideoToolbox remains visually-lossless only, while future backends can mark true lossless frames
-- **lossless-checksum**: Server computes frame hash, sends with lossless frame, browser verifies pixel-perfect delivery
+- **lossless-checksum** *(done)*: Server computes diagnostic RGBA checksums for CPU-readable frames, sends them as typed control messages, and the browser verifies decoded output in the HUD; this already proves current VideoToolbox refine frames are not bit-exact, while future true-lossless backends can validate cleanly
 - **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle
 - **browser-overlay-hybrid**: Move toolbars/metadata/annotations to native HTML/SVG overlay, reducing encoded viewport
 

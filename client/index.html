@@ -245,6 +245,7 @@
     const STALE_FRAME_TIMEOUT_MS = 250;
     const MAX_BUFFERED_FRAMES = 24;
     const DECODER_CONFIG_CONTROL = "decoder-config";
+    const FRAME_CHECKSUM_CONTROL = "frame-checksum";
     const SESSION_METRICS_CONTROL = "session-metrics";
 
     const canvas = document.getElementById("viewer");
@@ -405,6 +406,7 @@
         this.decoderConfigKey = "";
         this.reassembler = new FrameReassembler();
         this.pendingDecodes = new Map();
+        this.expectedChecksums = new Map();
         this.seenKeyframe = false;
         this.connected = false;
         this.connectionMode = "none";
@@ -417,6 +419,7 @@
         this.seenKeyframe = false;
         this.reassembler = new FrameReassembler();
         this.pendingDecodes = new Map();
+        this.expectedChecksums = new Map();
         this.metrics = createEmptyMetrics();
 
         updateButtons(true);
@@ -436,6 +439,7 @@
         this.seenKeyframe = false;
         this.reassembler = new FrameReassembler();
         this.pendingDecodes = new Map();
+        this.expectedChecksums = new Map();
         this.connectionMode = "none";
 
         updateButtons(false);
@@ -680,6 +684,7 @@
         }
 
         this.pendingDecodes = new Map();
+        this.expectedChecksums = new Map();
         this.decoder.configure(support.config);
         this.decoderConfigured = true;
         this.decoderConfigKey = JSON.stringify({
@@ -708,10 +713,10 @@
             }
           }
 
-          const decodeStartedAt = this.pendingDecodes.get(frame.timestamp);
-          if (decodeStartedAt != null) {
+          const pendingDecode = this.pendingDecodes.get(frame.timestamp);
+          if (pendingDecode) {
             this.pendingDecodes.delete(frame.timestamp);
-            const decodeMs = performance.now() - decodeStartedAt;
+            const decodeMs = performance.now() - pendingDecode.decodeStartedAt;
             this.metrics.lastDecodeMs = decodeMs;
             this.metrics.decodeSampleCount += 1;
             this.metrics.totalDecodeMs += decodeMs;
@@ -722,6 +727,15 @@
           ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
           this.metrics.framesDecoded += 1;
           this.metrics.lastFrameMs = performance.now();
+
+          if (pendingDecode) {
+            const expectedChecksum = this.expectedChecksums.get(pendingDecode.frameId);
+            if (expectedChecksum) {
+              this.expectedChecksums.delete(pendingDecode.frameId);
+              this.verifyFrameChecksum(pendingDecode, expectedChecksum);
+            }
+          }
+
           this.updateMetrics();
         } finally {
           frame.close();
@@ -765,7 +779,12 @@
         });
 
         try {
-          this.pendingDecodes.set(frame.timestampUs, performance.now());
+          this.pendingDecodes.set(frame.timestampUs, {
+            decodeStartedAt: performance.now(),
+            frameId: frame.frameId,
+            isRefine: frame.isRefine,
+            isLossless: frame.isLossless,
+          });
           this.decoder.decode(chunk);
           this.metrics.framesSubmitted += 1;
           this.updateMetrics();
@@ -801,6 +820,8 @@
             const config = decoderConfigFromControlMessage(message);
             await this.configureDecoder(config);
             setStatus(`Applied decoder config from control stream (${config.codec}).`);
+          } else if (message.type === FRAME_CHECKSUM_CONTROL) {
+            this.applyFrameChecksum(message);
           } else if (message.type === SESSION_METRICS_CONTROL) {
             this.applySessionMetrics(message);
           } else if (message.type === "status" && message.message) {
@@ -823,6 +844,49 @@
           this.metrics.transportRttMs = message.transportRttMs;
         }
         this.updateMetrics();
+      }
+
+      applyFrameChecksum(message) {
+        if (typeof message.frameId !== "number" || typeof message.hashHex !== "string") {
+          logLine(`Invalid frame checksum control message: ${JSON.stringify(message)}`);
+          return;
+        }
+
+        this.expectedChecksums.set(message.frameId, {
+          algorithm: typeof message.algorithm === "string" ? message.algorithm : "unknown",
+          hashHex: message.hashHex.toLowerCase(),
+          width: typeof message.width === "number" ? message.width : null,
+          height: typeof message.height === "number" ? message.height : null,
+        });
+        this.metrics.lastChecksumStatus = `pending frame ${message.frameId}`;
+        this.updateMetrics();
+      }
+
+      verifyFrameChecksum(pendingDecode, expectedChecksum) {
+        if (expectedChecksum.algorithm !== "fnv1a64-rgba8") {
+          this.metrics.lastChecksumStatus = `unsupported ${expectedChecksum.algorithm}`;
+          return;
+        }
+
+        try {
+          const actualHash = computeCanvasChecksumHex(ctx, canvas.width, canvas.height);
+          if (actualHash === expectedChecksum.hashHex) {
+            this.metrics.checksumVerified += 1;
+            this.metrics.lastChecksumStatus =
+              `ok ${truncateForHud(actualHash, 16)} (${pendingDecode.isLossless ? "lossless" : "refine"})`;
+            return;
+          }
+
+          this.metrics.checksumMismatches += 1;
+          this.metrics.lastChecksumStatus =
+            `mismatch ${truncateForHud(actualHash, 8)}/${truncateForHud(expectedChecksum.hashHex, 8)}`;
+          logLine(
+            `Checksum mismatch for frame ${pendingDecode.frameId}: expected ${expectedChecksum.hashHex}, got ${actualHash}`
+          );
+        } catch (error) {
+          this.metrics.lastChecksumStatus = `error ${truncateForHud(formatError(error), 20)}`;
+          logLine(`Checksum verification failed: ${formatError(error)}`);
+        }
       }
 
       sendUnreliable(bytes) {
@@ -917,6 +981,9 @@
           `frames decode:  ${this.metrics.framesDecoded}`,
           `frames dropped: ${this.metrics.framesDropped}`,
           `decode errors:  ${this.metrics.decodeErrors}`,
+          `checksum ok:    ${this.metrics.checksumVerified}`,
+          `checksum fail:  ${this.metrics.checksumMismatches}`,
+          `checksum last:  ${this.metrics.lastChecksumStatus}`,
           `input dg:       ${this.metrics.unreliableInputSent}`,
           `input reliable: ${this.metrics.reliableInputSent}`,
           `last type:      ${this.metrics.lastFrameType}`,
@@ -1134,6 +1201,9 @@
         totalDecodeMs: 0,
         encodeTimeUs: null,
         transportRttMs: null,
+        checksumVerified: 0,
+        checksumMismatches: 0,
+        lastChecksumStatus: "none",
       };
     }
 
@@ -1144,6 +1214,12 @@
 
       if (message.type === DECODER_CONFIG_CONTROL) {
         return message.codec ? `decoder-config ${message.codec}` : DECODER_CONFIG_CONTROL;
+      }
+
+      if (message.type === FRAME_CHECKSUM_CONTROL) {
+        return typeof message.frameId === "number"
+          ? `frame-checksum ${message.frameId}`
+          : FRAME_CHECKSUM_CONTROL;
       }
 
       if (message.type === SESSION_METRICS_CONTROL) {
@@ -1194,6 +1270,24 @@
         bytes[index] = binary.charCodeAt(index);
       }
       return bytes;
+    }
+
+    function computeCanvasChecksumHex(context, width, height) {
+      const imageData = context.getImageData(0, 0, width, height);
+      return fnv1a64Hex(imageData.data);
+    }
+
+    function fnv1a64Hex(bytes) {
+      let hash = 0xcbf29ce484222325n;
+      const prime = 0x100000001b3n;
+      const mask = 0xffffffffffffffffn;
+
+      for (let index = 0; index < bytes.length; index += 1) {
+        hash ^= BigInt(bytes[index]);
+        hash = (hash * prime) & mask;
+      }
+
+      return hash.toString(16).padStart(16, "0");
     }
 
     async function readReadableStream(stream) {
