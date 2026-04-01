@@ -1,0 +1,14 @@
+[package]
+name = "ustreamer-transport"
+description = "WebTransport server (QUIC/HTTP3 via quinn) with WebSocket fallback"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ustreamer-proto = { workspace = true }
+quinn = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }

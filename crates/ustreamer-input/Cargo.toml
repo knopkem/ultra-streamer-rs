@@ -1,0 +1,10 @@
+[package]
+name = "ustreamer-input"
+description = "Browser input event bridge — binary decode and mapping to application interaction events"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ustreamer-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

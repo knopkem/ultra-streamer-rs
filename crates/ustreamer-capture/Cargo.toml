@@ -1,0 +1,10 @@
+[package]
+name = "ustreamer-capture"
+description = "GPU frame capture from wgpu render targets — zero-copy (Metal/NVENC) and staging buffer paths"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

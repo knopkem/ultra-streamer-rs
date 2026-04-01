@@ -1,0 +1,11 @@
+[package]
+name = "ustreamer-encode"
+description = "Hardware video encoding — VideoToolbox (macOS), NVENC (NVIDIA), GStreamer (fallback)"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ustreamer-capture = { workspace = true }
+ustreamer-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

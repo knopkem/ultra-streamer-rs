@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ustreamer-capture",
+    "crates/ustreamer-encode",
+    "crates/ustreamer-transport",
+    "crates/ustreamer-input",
+    "crates/ustreamer-proto",
+    "crates/ustreamer-quality",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# GPU
+wgpu = "27.0"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+
+# QUIC / WebTransport
+quinn = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+bytemuck = { version = "1", features = ["derive"] }
+
+# Internal crates
+ustreamer-capture = { path = "crates/ustreamer-capture" }
+ustreamer-encode = { path = "crates/ustreamer-encode" }
+ustreamer-transport = { path = "crates/ustreamer-transport" }
+ustreamer-input = { path = "crates/ustreamer-input" }
+ustreamer-proto = { path = "crates/ustreamer-proto" }
+ustreamer-quality = { path = "crates/ustreamer-quality" }

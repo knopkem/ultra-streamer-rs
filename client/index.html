@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ultra-streamer</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #eee; font-family: system-ui; }
+    #viewer-container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    canvas {
+      background: #000;
+      max-width: 100%;
+      max-height: 100%;
+    }
+    #status {
+      position: absolute;
+      top: 8px;
+      left: 8px;
+      font-size: 12px;
+      opacity: 0.7;
+    }
+    #metrics {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      font-size: 11px;
+      font-family: monospace;
+      opacity: 0.7;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="viewer-container">
+    <canvas id="viewer" width="1920" height="1080" tabindex="0"></canvas>
+    <div id="status">Connecting...</div>
+    <div id="metrics"></div>
+  </div>
+
+  <script>
+    // ultra-streamer browser client — placeholder for Phase 1 implementation
+    // Will connect via WebTransport, decode with WebCodecs, capture input
+    const canvas = document.getElementById('viewer');
+    const status = document.getElementById('status');
+    const metrics = document.getElementById('metrics');
+    const ctx = canvas.getContext('2d');
+
+    status.textContent = 'Client loaded — waiting for WebTransport server';
+
+    // TODO Phase 1:
+    // 1. WebTransport connection to server
+    // 2. WebCodecs VideoDecoder setup (H.265 Main10, optimizeForLatency)
+    // 3. Datagram reassembly → EncodedVideoChunk → decoder → canvas
+    // 4. Input capture (PointerEvent, KeyboardEvent, wheel) → binary → datagrams
+    // 5. Latency metrics display
+  </script>
+</body>
+</html>
