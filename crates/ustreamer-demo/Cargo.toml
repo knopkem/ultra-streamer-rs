@@ -4,6 +4,10 @@ description = "Headless live-test demo for ultra-streamer-rs"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+nvenc-direct = ["ustreamer-capture/vulkan-external", "ustreamer-encode/nvenc-direct"]
+
 [dependencies]
 anyhow = { workspace = true }
 bytemuck = { workspace = true }

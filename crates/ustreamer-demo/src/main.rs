@@ -1,9 +1,3 @@
-#[cfg(not(target_os = "macos"))]
-fn main() -> anyhow::Result<()> {
-    anyhow::bail!("ustreamer-demo currently requires macOS for VideoToolbox encoding")
-}
-
-#[cfg(target_os = "macos")]
 fn main() -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
 
@@ -14,13 +8,13 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    macos_demo::run()
+    demo::run()
 }
 
-#[cfg(target_os = "macos")]
-mod macos_demo {
+mod demo {
     use std::borrow::Cow;
     use std::collections::HashSet;
+    use std::env;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::num::NonZeroU64;
@@ -33,8 +27,22 @@ mod macos_demo {
     use bytemuck::{Pod, Zeroable};
     use tokio::runtime::Runtime;
     use tracing::{error, info, warn};
-    use ustreamer_capture::{FrameCapture, staging::StagingCapture};
-    use ustreamer_encode::{FrameEncoder, videotoolbox::VideoToolboxEncoder};
+    use ustreamer_capture::FrameCapture;
+    #[cfg(all(
+        feature = "nvenc-direct",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    use ustreamer_capture::VulkanExternalCapture;
+    #[cfg(target_os = "macos")]
+    use ustreamer_capture::staging::StagingCapture;
+    use ustreamer_encode::FrameEncoder;
+    #[cfg(all(
+        feature = "nvenc-direct",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    use ustreamer_encode::nvenc::NvencEncoder;
+    #[cfg(target_os = "macos")]
+    use ustreamer_encode::videotoolbox::VideoToolboxEncoder;
     use ustreamer_input::{AppAction, InputMapper, InteractionMode};
     use ustreamer_proto::control::{
         ControlMessage, FrameChecksumMessage, SessionMetricsMessage, StatusMessage,
@@ -56,7 +64,145 @@ mod macos_demo {
 
     type SessionRegistry = Arc<Mutex<Vec<SessionSlot>>>;
 
+    #[derive(Debug, Clone, Copy, Default)]
+    struct DemoOptions {
+        nvenc_device: usize,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum DemoBackend {
+        #[cfg(target_os = "macos")]
+        VideoToolbox,
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        NvencDirect { cuda_device: usize },
+    }
+
+    impl DemoOptions {
+        fn parse() -> Result<Self> {
+            Self::parse_from_iter(env::args().skip(1))
+        }
+
+        fn parse_from_iter<I, S>(args: I) -> Result<Self>
+        where
+            I: IntoIterator<Item = S>,
+            S: AsRef<str>,
+        {
+            let mut options = Self::default();
+            let mut args = args.into_iter();
+            while let Some(arg) = args.next() {
+                match arg.as_ref() {
+                    "--nvenc-device" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| anyhow!("--nvenc-device requires a value"))?;
+                        options.nvenc_device = value.as_ref().parse().with_context(|| {
+                            format!("invalid --nvenc-device value `{}`", value.as_ref())
+                        })?;
+                    }
+                    "--help" | "-h" => {
+                        anyhow::bail!(
+                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct] [-- --nvenc-device <ordinal>]"
+                        );
+                    }
+                    other => {
+                        anyhow::bail!(
+                            "unrecognized argument `{other}`; supported: --nvenc-device <ordinal>"
+                        );
+                    }
+                }
+            }
+            Ok(options)
+        }
+    }
+
+    impl DemoBackend {
+        fn select(options: DemoOptions) -> Result<Self> {
+            #[cfg(target_os = "macos")]
+            {
+                let _ = options;
+                return Ok(Self::VideoToolbox);
+            }
+            #[cfg(all(
+                feature = "nvenc-direct",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            {
+                return Ok(Self::NvencDirect {
+                    cuda_device: options.nvenc_device,
+                });
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            {
+                anyhow::bail!(
+                    "ustreamer-demo on {} requires the `nvenc-direct` feature; run `cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device {}`",
+                    env::consts::OS,
+                    options.nvenc_device
+                );
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            anyhow::bail!("ustreamer-demo is not supported on {}", env::consts::OS);
+        }
+
+        fn description(self) -> String {
+            match self {
+                #[cfg(target_os = "macos")]
+                Self::VideoToolbox => "VideoToolbox HEVC + staging capture".into(),
+                #[cfg(all(
+                    feature = "nvenc-direct",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::NvencDirect { cuda_device } => format!(
+                    "direct NVENC HEVC + Vulkan external capture (cuda_device={cuda_device})"
+                ),
+            }
+        }
+
+        fn renderer_backends(self) -> wgpu::Backends {
+            match self {
+                #[cfg(target_os = "macos")]
+                Self::VideoToolbox => wgpu::Backends::PRIMARY,
+                #[cfg(all(
+                    feature = "nvenc-direct",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::NvencDirect { .. } => wgpu::Backends::VULKAN,
+            }
+        }
+
+        fn create_capture(self) -> Box<dyn FrameCapture> {
+            match self {
+                #[cfg(target_os = "macos")]
+                Self::VideoToolbox => Box::new(StagingCapture::new(3)),
+                #[cfg(all(
+                    feature = "nvenc-direct",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::NvencDirect { .. } => Box::new(VulkanExternalCapture::new()),
+            }
+        }
+
+        fn create_encoder(self) -> Result<Box<dyn FrameEncoder>> {
+            match self {
+                #[cfg(target_os = "macos")]
+                Self::VideoToolbox => Ok(Box::new(VideoToolboxEncoder::new())),
+                #[cfg(all(feature = "nvenc-direct", any(target_os = "linux", target_os = "windows")))]
+                Self::NvencDirect { cuda_device } => NvencEncoder::with_cuda_device(cuda_device)
+                    .map(|encoder| Box::new(encoder) as Box<dyn FrameEncoder>)
+                    .map_err(|error| {
+                        anyhow!(
+                            "failed to create direct NVENC encoder on CUDA device {cuda_device}: {error}"
+                        )
+                    }),
+            }
+        }
+    }
+
     pub fn run() -> Result<()> {
+        let options = DemoOptions::parse().context("failed to parse demo options")?;
+        let backend = DemoBackend::select(options)?;
         let stream_addr = SocketAddr::from(([127, 0, 0, 1], STREAM_PORT));
         let http_addr = SocketAddr::from(([127, 0, 0, 1], HTTP_PORT));
 
@@ -87,10 +233,11 @@ mod macos_demo {
             .block_on(HeadlessRenderer::new(
                 initial_params.width,
                 initial_params.height,
+                backend.renderer_backends(),
             ))
             .context("failed to create headless renderer")?;
-        let mut capture = StagingCapture::new(3);
-        let mut encoder = VideoToolboxEncoder::new();
+        let mut capture = backend.create_capture();
+        let mut encoder = backend.create_encoder()?;
         let mut scene = DemoScene::default();
         let mut frame_id = 0u32;
         let mut configured_generations = HashSet::new();
@@ -100,6 +247,7 @@ mod macos_demo {
         let start_time = Instant::now();
 
         info!("Headless demo ready.");
+        info!("Using {}.", backend.description());
         info!("Open http://127.0.0.1:{HTTP_PORT}/ in Chrome/Chromium.");
         info!("WebSocket stream endpoint: ws://127.0.0.1:{STREAM_PORT}/stream");
         info!(
@@ -669,8 +817,11 @@ mod macos_demo {
     }
 
     impl HeadlessRenderer {
-        async fn new(width: u32, height: u32) -> Result<Self> {
-            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        async fn new(width: u32, height: u32, backends: wgpu::Backends) -> Result<Self> {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends,
+                ..Default::default()
+            });
             let adapter = instance
                 .request_adapter(&wgpu::RequestAdapterOptions {
                     power_preference: wgpu::PowerPreference::HighPerformance,
@@ -679,6 +830,11 @@ mod macos_demo {
                 })
                 .await
                 .context("failed to request headless wgpu adapter")?;
+            let adapter_info = adapter.get_info();
+            info!(
+                "Using wgpu adapter: {} (backend={:?})",
+                adapter_info.name, adapter_info.backend
+            );
             let (device, queue) = adapter
                 .request_device(&wgpu::DeviceDescriptor {
                     label: Some("ustreamer-demo-device"),
@@ -964,4 +1120,27 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
+
+    #[cfg(test)]
+    mod tests {
+        use super::DemoOptions;
+
+        #[test]
+        fn parses_default_demo_options() {
+            let options = DemoOptions::parse_from_iter(std::iter::empty::<&str>()).unwrap();
+            assert_eq!(options.nvenc_device, 0);
+        }
+
+        #[test]
+        fn parses_nvenc_device_flag() {
+            let options = DemoOptions::parse_from_iter(["--nvenc-device", "3"]).unwrap();
+            assert_eq!(options.nvenc_device, 3);
+        }
+
+        #[test]
+        fn rejects_unknown_demo_flag() {
+            let error = DemoOptions::parse_from_iter(["--bogus"]).unwrap_err();
+            assert!(error.to_string().contains("unrecognized argument"));
+        }
+    }
 }

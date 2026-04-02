@@ -4,7 +4,9 @@
 //! using the scripts `sys/linux_sys/bindgen.sh` and
 //! `sys/windows_sys/bindgen.ps1` for the respective operating system.
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod guid;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod version;
 
 #[allow(warnings)]

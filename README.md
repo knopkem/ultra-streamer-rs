@@ -8,7 +8,7 @@ The first fast path is now implemented on macOS: `wgpu` Metal texture → IOSurf
 
 The first Vulkan/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, exports a platform external-memory handle (`OPAQUE_FD` on Linux, `OPAQUE_WIN32` on Windows), and tags each captured frame with an explicit synchronization contract. The default mode remains conservatively `HostSynchronized`, and there is now an opt-in exported timeline semaphore mode that host-signals an external semaphore handle after the capture wait so the CUDA side can exercise a real semaphore import/wait path. That conservative `HostSynchronized` path is now runtime-validated on a real Windows RTX 2070 host.
 
-The first encode-side NVENC path is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, imports both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory, and uses a minimal direct NVENC session to register the imported CUDA pointer and read back encoded HEVC/AV1 bitstreams. The current CUDA import path uses an explicit dedicated-allocation import descriptor rather than `cudarc`'s generic helper so Vulkan's dedicated image allocation contract is preserved. On Windows, exported Vulkan memory/semaphore handles also request explicit read/write access rights for CUDA interop, and the NVENC API entrypoints are now loaded directly from the NVIDIA driver runtime (`nvEncodeAPI64.dll`) instead of depending on SDK import libraries at link time. To keep that path deterministic, the project now vendors a stripped local copy of the NVENC raw binding crate that exposes only the encoder `sys` bindings needed by `ustreamer-encode`. Decoder-config extraction, GPU-driven semaphore handoff, and true-lossless refine are still pending.
+The first encode-side NVENC path is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, imports both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory, and uses a minimal direct NVENC session to register the imported CUDA pointer and read back encoded HEVC/AV1 bitstreams. The current CUDA import path uses an explicit dedicated-allocation import descriptor rather than `cudarc`'s generic helper so Vulkan's dedicated image allocation contract is preserved. On Windows, exported Vulkan memory/semaphore handles also request explicit read/write access rights for CUDA interop, and the NVENC API entrypoints are now loaded directly from the NVIDIA driver runtime (`nvEncodeAPI64.dll`) instead of depending on SDK import libraries at link time. To keep that path deterministic, the project now vendors a stripped local copy of the NVENC raw binding crate that exposes only the encoder `sys` bindings needed by `ustreamer-encode`. The HEVC path now also queries NVENC sequence parameters to build browser-ready `hvcC` decoder config and normalizes HEVC access units into the length-prefixed format already consumed by the browser client. GPU-driven semaphore handoff, AV1 decoder-config extraction, and true-lossless refine are still pending.
 
 ## Use Cases
 
@@ -47,8 +47,8 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Hardware video encoding** at up to 4K@60fps with < 3ms encode latency
 - **macOS VideoToolbox HEVC backend** with native length-prefixed access units and `hvcC` decoder-config extraction
 - **Feature-gated Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, exports `OPAQUE_FD` (Linux) or `OPAQUE_WIN32` (Windows) handles, and supports both conservative host-sync and opt-in exported-timeline-semaphore handoff modes
-- **Feature-gated CUDA import + direct NVENC backend** — validates exported Vulkan frames, builds direct-NVENC import/rate-control/sync descriptors, imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory with explicit dedicated-allocation handling, and drives a minimal real NVENC session/bitstream path
-- **Windows NVENC probe binary** — forces Vulkan, uploads a known test texture, validates `HostSynchronized` plus optional exported-timeline-semaphore capture, checks CUDA import/wait, and now attempts a real encoded bitstream on the direct NVENC path; `HostSynchronized` is already validated on a real RTX 2070 host through the pre-bitstream probe boundary
+- **Feature-gated CUDA import + direct NVENC backend** — validates exported Vulkan frames, builds direct-NVENC import/rate-control/sync descriptors, imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory with explicit dedicated-allocation handling, drives a minimal real NVENC session/bitstream path, and emits browser-ready HEVC with cached `hvcC` plus length-prefixed access units
+- **Windows NVENC probe binary** — forces Vulkan, uploads a known test texture, validates `HostSynchronized` plus optional exported-timeline-semaphore capture, checks CUDA import/wait, and now confirms real NVENC HEVC output on a real RTX 2070 host
 - **WebTransport + WebCodecs** for lowest possible browser delivery latency
 - **WebSocket fallback transport** for browsers or environments without WebTransport
 - **Settle refinement groundwork** — quality-controller mode switching and forced keyframes on idle refine
@@ -57,12 +57,12 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Compact binary input protocol** — sub-millisecond input event delivery
 - **Typed control protocol** — shared decoder-config / status / session-metrics / frame-checksum JSON messages
 - **Browser metrics HUD** — decode timing, frame drops, connection mode, server-fed RTT/encode telemetry, and checksum verification status
-- **Headless live-test demo** — offscreen `wgpu` renderer streamed to the bundled browser client on macOS
+- **Headless live-test demo** — offscreen `wgpu` renderer streamed to the bundled browser client on macOS, plus a feature-gated Vulkan/NVENC demo path on Windows/Linux
 - **Multi-client demo broadcast** — multiple browser viewers can attach to the same headless demo stream simultaneously
 
 ## Quick Live Test
 
-On macOS, you can already run a local smoke-test server:
+On macOS, you can run the existing VideoToolbox smoke-test server:
 
 ```bash
 cargo run -p ustreamer-demo
@@ -70,11 +70,19 @@ cargo run -p ustreamer-demo
 
 Then open `http://127.0.0.1:8090/` in Chrome/Chromium.
 
+On Windows or Linux with an NVIDIA GPU, you can now run the direct-NVENC demo path:
+
+```bash
+cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device 0
+```
+
+That path forces a Vulkan `wgpu` renderer backend so the zero-copy Vulkan external-memory capture path can feed NVENC directly.
+
 The demo currently exercises:
 
 - headless `wgpu` rendering
-- staging-buffer capture
-- VideoToolbox HEVC encode
+- staging-buffer capture on macOS, Vulkan external-memory capture on Windows/Linux with `nvenc-direct`
+- VideoToolbox HEVC encode on macOS, direct NVENC HEVC encode on Windows/Linux with `nvenc-direct`
 - WebSocket browser transport
 - WebCodecs decode and interactive input round-trip
 - settle/refine frame signaling in the browser HUD

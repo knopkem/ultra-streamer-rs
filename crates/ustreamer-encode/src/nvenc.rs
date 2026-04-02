@@ -2086,8 +2086,8 @@ mod tests {
 
     use super::{
         HEVC_HVCC_LENGTH_SIZE_MINUS_ONE, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS,
-        NvencEncoder, NvencInputFormat, build_hevc_hvcc_description,
-        extract_hevc_parameter_sets, normalize_hevc_access_unit,
+        NvencEncoder, NvencInputFormat, build_hevc_hvcc_description, extract_hevc_parameter_sets,
+        normalize_hevc_access_unit,
     };
     #[cfg(target_os = "linux")]
     use super::{NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor};
