@@ -427,7 +427,7 @@ impl FrameCapture for VulkanExternalCapture {
         let sync = match sync_mode {
             VulkanCaptureSyncMode::HostSynchronized => VulkanExternalSync::HostSynchronized,
             VulkanCaptureSyncMode::ExportedTimelineSemaphore => {
-                let (_semaphore, value) = queued_sync.ok_or_else(|| {
+                let (semaphore, value) = queued_sync.ok_or_else(|| {
                     CaptureError::VulkanInteropFailed(
                         "capture did not queue the exportable timeline semaphore signal".into(),
                     )

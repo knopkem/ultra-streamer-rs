@@ -32,6 +32,13 @@ mod demo {
         drain_mapped_input_events,
     };
     use ustreamer_capture::FrameCapture;
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            feature = "gstreamer-fallback",
+            any(target_os = "linux", target_os = "windows")
+        )
+    ))]
     use ustreamer_capture::staging::StagingCapture;
     #[cfg(all(
         feature = "nvenc-direct",
@@ -156,11 +163,7 @@ mod demo {
             };
             format!(
                 "{vendor_name} adapter {} (vendor={} / 0x{:04x}, backend={:?}, device_type={:?})",
-                self.adapter_name,
-                vendor_name,
-                self.vendor_id,
-                self.backend,
-                self.device_type
+                self.adapter_name, vendor_name, self.vendor_id, self.backend, self.device_type
             )
         }
     }
@@ -176,6 +179,13 @@ mod demo {
             }
         }
 
+        #[cfg(any(
+            test,
+            all(
+                feature = "nvenc-direct",
+                any(target_os = "linux", target_os = "windows")
+            )
+        ))]
         fn arg_name(self) -> &'static str {
             match self {
                 Self::Hevc => "hevc",
@@ -316,7 +326,7 @@ mod demo {
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         fn select(
-            options: DemoOptions,
+            _options: DemoOptions,
             graphics_probe: Option<&DemoGraphicsProbe>,
         ) -> Result<Self> {
             let detected_vendor = graphics_probe
@@ -325,17 +335,20 @@ mod demo {
             let detected_hardware = graphics_probe
                 .map(|probe| probe.describe())
                 .unwrap_or_else(|| format!("{} host", env::consts::OS));
-            let mut errors = Vec::new();
+            #[cfg(any(feature = "nvenc-direct", feature = "gstreamer-fallback"))]
+            let mut errors: Vec<String> = Vec::new();
+            #[cfg(not(any(feature = "nvenc-direct", feature = "gstreamer-fallback")))]
+            let errors: Vec<String> = Vec::new();
 
             match detected_vendor {
                 DemoGpuVendor::Amd => {
                     #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(options, graphics_probe) {
+                    match try_select_gstreamer_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
                     }
                     #[cfg(feature = "nvenc-direct")]
-                    match try_select_nvenc_backend(options, graphics_probe) {
+                    match try_select_nvenc_backend(_options, graphics_probe) {
                         Ok(backend) => {
                             warn!(
                                 "Detected AMD hardware ({detected_hardware}) but the GStreamer fallback path was unavailable. Using NVENC path instead."
@@ -347,12 +360,12 @@ mod demo {
                 }
                 DemoGpuVendor::Nvidia => {
                     #[cfg(feature = "nvenc-direct")]
-                    match try_select_nvenc_backend(options, graphics_probe) {
+                    match try_select_nvenc_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("NVENC: {error:#}")),
                     }
                     #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(options, graphics_probe) {
+                    match try_select_gstreamer_backend(_options, graphics_probe) {
                         Ok(backend) => {
                             warn!(
                                 "Detected NVIDIA hardware ({detected_hardware}) but the direct NVENC path was unavailable. Falling back to GStreamer."
@@ -364,12 +377,12 @@ mod demo {
                 }
                 DemoGpuVendor::Unknown => {
                     #[cfg(feature = "nvenc-direct")]
-                    match try_select_nvenc_backend(options, graphics_probe) {
+                    match try_select_nvenc_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("NVENC: {error:#}")),
                     }
                     #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(options, graphics_probe) {
+                    match try_select_gstreamer_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
                     }
@@ -664,6 +677,13 @@ mod demo {
         false
     }
 
+    #[cfg(any(
+        test,
+        all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        )
+    ))]
     fn resolve_demo_codec(
         requested_codec: Option<DemoCodec>,
         supported_codecs: &[DemoCodec],
@@ -690,6 +710,13 @@ mod demo {
         );
     }
 
+    #[cfg(any(
+        test,
+        all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        )
+    ))]
     fn format_demo_codecs(codecs: &[DemoCodec]) -> String {
         if codecs.is_empty() {
             return "none".into();

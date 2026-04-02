@@ -47,6 +47,15 @@ cargo run -p ustreamer-demo --features gstreamer-fallback
 cargo run -p ustreamer-demo --features nvenc-direct,gstreamer-fallback
 ```
 
+On **Windows/MSVC**, `gstreamer-fallback` also needs the native **GStreamer development** install at build time, not just the runtime. Install both the official `gstreamer-1.0-msvc-x86_64-*.msi` runtime and `gstreamer-1.0-devel-msvc-x86_64-*.msi` development package, then make sure `C:\gstreamer\1.0\msvc_x86_64\bin` is on `PATH` so both `pkg-config.exe` and `gst-inspect-1.0.exe` are visible to Cargo. If you installed GStreamer somewhere else, point `PKG_CONFIG_PATH` at that tree's `lib\pkgconfig` directory. A quick sanity check before `cargo run` is:
+
+```powershell
+pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-base-1.0
+gst-inspect-1.0 amfh265enc
+```
+
+Use the **MSVC** Rust toolchain with the **MSVC** GStreamer binaries; do not mix MinGW/MSYS2 GStreamer packages into the same build.
+
 Then open `http://127.0.0.1:8090/` in Chrome/Chromium.
 
 The demo auto-detects your GPU and selects the best encoder. Override with `--codec hevc|av1` or `--nvenc-device <n>` if needed.
