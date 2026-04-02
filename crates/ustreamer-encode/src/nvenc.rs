@@ -7,9 +7,9 @@
 //! HEVC output is normalized into length-prefixed access units with cached
 //! `hvcC` decoder config for browser-side WebCodecs consumption, while the AV1
 //! path now extracts a browser-ready Sequence Header OBU and derives an RFC 6381
-//! codec string for WebCodecs. True GPU-driven semaphore handoff remains
-//! pending, while HEVC refine frames now use true lossless NVENC settings when
-//! the active device reports support.
+//! codec string for WebCodecs. Queue-signaled timeline semaphore handoff is now
+//! wired on the capture side, while HEVC refine frames use true lossless NVENC
+//! settings when the active device reports support.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;

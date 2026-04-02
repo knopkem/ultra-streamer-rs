@@ -48,7 +48,7 @@ pub enum VulkanExternalSyncHandle {
 pub enum VulkanExternalSync {
     /// The capture path waited on the host before handing the frame to encode.
     HostSynchronized,
-    /// A future GPU-only handoff path via exported semaphore handle.
+    /// A GPU-driven handoff path via exported timeline semaphore handle.
     ExternalSemaphore {
         handle: VulkanExternalSyncHandle,
         value: u64,
@@ -61,8 +61,8 @@ pub enum VulkanCaptureSyncMode {
     /// Wait on the host before returning the frame to encode.
     #[default]
     HostSynchronized,
-    /// After the host wait, signal an exportable timeline semaphore and hand its
-    /// external handle to the encode path.
+    /// Signal an exportable timeline semaphore from the GPU submission and hand
+    /// its external handle to the encode path.
     ExportedTimelineSemaphore,
 }
 
@@ -402,8 +402,23 @@ impl FrameCapture for VulkanExternalCapture {
             cached.texture.as_image_copy(),
             texture.size(),
         );
+        let queued_sync = match sync_mode {
+            VulkanCaptureSyncMode::HostSynchronized => None,
+            VulkanCaptureSyncMode::ExportedTimelineSemaphore => {
+                let semaphore = cached.sync_semaphore.ok_or_else(|| {
+                    CaptureError::VulkanInteropFailed(
+                        "cached export texture is missing its exportable timeline semaphore".into(),
+                    )
+                })?;
+                let value = cached.next_sync_value();
+                enqueue_signal_on_next_submit(queue, semaphore, value)?;
+                Some((semaphore, value))
+            }
+        };
         queue.submit(std::iter::once(encoder.finish()));
-        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        if sync_mode == VulkanCaptureSyncMode::HostSynchronized {
+            device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        }
 
         #[cfg(target_os = "linux")]
         let handle = export_memory_handle(instance, device, cached.device_memory)?;
@@ -412,13 +427,11 @@ impl FrameCapture for VulkanExternalCapture {
         let sync = match sync_mode {
             VulkanCaptureSyncMode::HostSynchronized => VulkanExternalSync::HostSynchronized,
             VulkanCaptureSyncMode::ExportedTimelineSemaphore => {
-                let semaphore = cached.sync_semaphore.ok_or_else(|| {
+                let (_semaphore, value) = queued_sync.ok_or_else(|| {
                     CaptureError::VulkanInteropFailed(
-                        "cached export texture is missing its exportable timeline semaphore".into(),
+                        "capture did not queue the exportable timeline semaphore signal".into(),
                     )
                 })?;
-                let value = cached.next_sync_value();
-                signal_exported_timeline_semaphore(device, semaphore, value)?;
                 #[cfg(target_os = "linux")]
                 let handle = export_sync_handle(instance, device, semaphore)?;
                 #[cfg(target_os = "windows")]
@@ -989,23 +1002,20 @@ fn create_exportable_timeline_semaphore(
     Ok(Some(semaphore))
 }
 
-fn signal_exported_timeline_semaphore(
-    device: &wgpu::Device,
+fn enqueue_signal_on_next_submit(
+    queue: &wgpu::Queue,
     semaphore: vk::Semaphore,
     value: u64,
 ) -> Result<(), CaptureError> {
-    let device_hal = unsafe {
-        device
+    let queue_hal = unsafe {
+        queue
             .as_hal::<wgpu::hal::api::Vulkan>()
             .ok_or(CaptureError::UnsupportedBackend(
-                "wgpu device is not using Vulkan",
+                "wgpu queue is not using Vulkan",
             ))?
     };
-    let signal_info = vk::SemaphoreSignalInfo::default()
-        .semaphore(semaphore)
-        .value(value);
-    unsafe { device_hal.raw_device().signal_semaphore(&signal_info) }
-        .map_err(|error| map_vk_error("vkSignalSemaphore", error))
+    queue_hal.add_signal_semaphore(semaphore, Some(value));
+    Ok(())
 }
 
 fn export_memory_handle(
