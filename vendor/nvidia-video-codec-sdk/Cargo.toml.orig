@@ -1,0 +1,31 @@
+[package]
+name = "nvidia-video-codec-sdk"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.70"
+
+description = "Bindings for NVIDIA Video Codec SDK"
+homepage = "https://github.com/ViliamVadocz/nvidia-video-codec-sdk"
+documentation = "https://docs.rs/nvidia-video-codec-sdk"
+repository = "https://github.com/ViliamVadocz/nvidia-video-codec-sdk"
+readme = "README.md"
+
+keywords = ["encoding", "decoding", "bindings", "nvidia", "cuda"]
+
+[package.metadata.docs.rs]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+features = ["ci-check"]
+
+[dependencies]
+cudarc = { version = "0.16.4", features = ["cuda-version-from-build-system"] }
+lazy_static = "1.5.0"
+
+[dev-dependencies]
+vulkano = "0.35.0"
+libc = "0.2"
+
+[features]
+default = []
+# workaround to make the ci similar to cudarc
+ci-check = ["cudarc/cuda-12020", "cudarc/dynamic-loading"]

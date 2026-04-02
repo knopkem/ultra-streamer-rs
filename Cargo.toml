@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/nvidia-video-codec-sdk"]
 members = [
     "crates/ustreamer-capture",
     "crates/ustreamer-demo",
