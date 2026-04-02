@@ -26,7 +26,7 @@ crates/
 ├── ustreamer-app        # App-facing integration traits/helpers for frame source + input wiring
 ├── ustreamer-capture    # GPU frame capture (zero-copy Metal/NVENC + staging fallback)
 ├── ustreamer-demo       # Headless live-test server (macOS VideoToolbox or Windows/Linux Vulkan+NVENC)
-├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, GStreamer)
+├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, GStreamer fallback)
 ├── ustreamer-nvenc-probe # Windows Vulkan→CUDA/NVENC validation harness
 ├── ustreamer-transport  # WebTransport server/session layer + WebSocket fallback
 ├── ustreamer-input      # Browser input → application action mapping
@@ -40,7 +40,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 
 - **Apple Silicon (M4+)** — VideoToolbox H.265 via IOSurface zero-copy
 - **NVIDIA RTX 30/40/50** — NVENC H.265/AV1 via CUDA external memory
-- **AMD RDNA3+** (fallback) — GStreamer with AMF/VA-API
+- **AMD RDNA3+** (feature-gated fallback) — GStreamer with AMF/VA-API HEVC
 
 ## Key Features
 
@@ -49,6 +49,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **macOS VideoToolbox HEVC backend** with native length-prefixed access units and `hvcC` decoder-config extraction
 - **Feature-gated Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, exports `OPAQUE_FD` (Linux) or `OPAQUE_WIN32` (Windows) handles, and supports both conservative host-sync and opt-in exported-timeline-semaphore handoff modes
 - **Feature-gated CUDA import + direct NVENC backend** — validates exported Vulkan frames, builds direct-NVENC import/rate-control/sync descriptors, imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA with explicit dedicated-allocation handling, maps exported Vulkan images as CUDA mipmapped arrays / `CUDAARRAY` resources, drives a minimal real NVENC session/bitstream path, emits browser-ready HEVC with derived `hvcC`/codec metadata plus length-prefixed access units, exposes AV1 Sequence Header decoder config for WebCodecs, and now enables true-lossless HEVC refine on supported NVIDIA devices
+- **Feature-gated GStreamer fallback backend** — `ustreamer-encode` now exposes runtime probing plus a staged CPU-BGRA HEVC path (`appsrc -> videoconvert -> encoder -> h265parse -> appsink`) for Windows AMF (`amfh265enc`) and Linux VA-API (`vaapih265enc`), normalizes HEVC access units for WebCodecs, and derives browser decoder config from the first keyframe
 - **Windows NVENC probe binary** — forces Vulkan, uploads a known test texture, validates `HostSynchronized` plus optional exported-timeline-semaphore capture, checks CUDA import/wait, and now confirms real NVENC HEVC output on a real RTX 2070 host with diagnostics that reflect the CUDA resource kind actually registered with NVENC
 - **WebTransport + WebCodecs** for lowest possible browser delivery latency
 - **WebSocket fallback transport** for browsers or environments without WebTransport
@@ -80,6 +81,22 @@ cargo run -p ustreamer-demo --features nvenc-direct
 ```
 
 That path forces a Vulkan `wgpu` renderer backend so the zero-copy Vulkan external-memory capture path can feed NVENC directly. The demo now probes the selected/default CUDA device at startup and automatically prefers AV1 when the detected NVENC device supports it, otherwise it falls back to HEVC. It also auto-selects exported-timeline-semaphore capture only when the active Vulkan device exposes external semaphore export, otherwise it stays on `HostSynchronized` and will fall back there again if the timeline path faults. You can still override codec selection with flags like `--nvenc-device 0` and `--codec hevc|av1`.
+
+On Linux or Windows with the appropriate GStreamer runtime/plugins installed, you can now run the staged fallback path:
+
+```bash
+cargo run -p ustreamer-demo --features gstreamer-fallback -- --codec hevc
+```
+
+That path keeps the renderer on the normal `wgpu` backend set, captures through the existing CPU staging path, and feeds BGRA frames into a low-latency GStreamer HEVC pipeline. If you enable both `nvenc-direct` and `gstreamer-fallback`, the demo will keep preferring NVENC first and fall back to GStreamer when NVENC probing fails.
+
+For a single Windows/Linux demo binary that auto-detects AMD vs NVIDIA hardware at runtime, build with both features:
+
+```bash
+cargo run -p ustreamer-demo --features nvenc-direct,gstreamer-fallback
+```
+
+That combined build now probes the preferred high-performance `wgpu` adapter first. NVIDIA adapters prefer the direct NVENC path; AMD/Radeon adapters prefer the GStreamer fallback path. On Linux the GStreamer probe now auto-detects `vah265enc` first and falls back to `vaapih265enc`; on Windows it looks for `amfh265enc`.
 
 The demo currently exercises:
 

@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/ustreamer-app"
+readme = "../../README.md"
+keywords = ["streaming", "integration", "input", "wgpu", "browser"]
 
 [dependencies]
 wgpu = { workspace = true }

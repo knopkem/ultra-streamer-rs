@@ -11,6 +11,7 @@ publish = false
 
 [features]
 default = []
+gstreamer-fallback = ["ustreamer-encode/gstreamer-fallback"]
 nvenc-direct = ["ustreamer-capture/vulkan-external", "ustreamer-encode/nvenc-direct"]
 
 [dependencies]

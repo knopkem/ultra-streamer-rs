@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/ustreamer-proto"
+readme = "../../README.md"
+keywords = ["streaming", "protocol", "webcodecs", "webtransport", "wgpu"]
 
 [dependencies]
 base64 = "0.22"

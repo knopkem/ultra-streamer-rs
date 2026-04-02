@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://docs.rs/ustreamer-quality"
+readme = "../../README.md"
+keywords = ["streaming", "quality", "latency", "adaptive", "bitrate"]
 
 [dependencies]
 ustreamer-proto = { workspace = true }

@@ -32,7 +32,6 @@ mod demo {
         drain_mapped_input_events,
     };
     use ustreamer_capture::FrameCapture;
-    #[cfg(target_os = "macos")]
     use ustreamer_capture::staging::StagingCapture;
     #[cfg(all(
         feature = "nvenc-direct",
@@ -40,6 +39,13 @@ mod demo {
     ))]
     use ustreamer_capture::{VulkanCaptureSyncMode, VulkanExternalCapture};
     use ustreamer_encode::FrameEncoder;
+    #[cfg(all(
+        feature = "gstreamer-fallback",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    use ustreamer_encode::gstreamer::{
+        GStreamerBackend, GStreamerCodec, GStreamerEncoder, GStreamerPipelinePlan,
+    };
     #[cfg(all(
         feature = "nvenc-direct",
         any(target_os = "linux", target_os = "windows")
@@ -53,6 +59,11 @@ mod demo {
     };
     use ustreamer_proto::frame::{FramePacket, packetize_frame};
     use ustreamer_proto::input::InputEvent;
+    #[cfg(all(
+        feature = "gstreamer-fallback",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    use ustreamer_proto::quality::EncodeParams;
     use ustreamer_proto::quality::QualityTier;
     use ustreamer_quality::{QualityConfig, QualityController};
     use ustreamer_transport::{WebSocketServer, WebSocketSession};
@@ -73,6 +84,87 @@ mod demo {
         Av1,
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DemoGpuVendor {
+        Nvidia,
+        Amd,
+        Unknown,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows", test))]
+    fn classify_demo_gpu_vendor(vendor_id: u32, adapter_name: &str) -> DemoGpuVendor {
+        const NVIDIA_VENDOR_ID: u32 = 0x10de;
+        const AMD_VENDOR_ID: u32 = 0x1002;
+
+        match vendor_id {
+            NVIDIA_VENDOR_ID => DemoGpuVendor::Nvidia,
+            AMD_VENDOR_ID => DemoGpuVendor::Amd,
+            _ => {
+                let lower = adapter_name.to_ascii_lowercase();
+                if lower.contains("nvidia") {
+                    DemoGpuVendor::Nvidia
+                } else if lower.contains("amd") || lower.contains("radeon") {
+                    DemoGpuVendor::Amd
+                } else {
+                    DemoGpuVendor::Unknown
+                }
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[derive(Debug, Clone)]
+    struct DemoGraphicsProbe {
+        adapter_name: String,
+        vendor_id: u32,
+        vendor: DemoGpuVendor,
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    impl DemoGraphicsProbe {
+        async fn detect() -> Result<Self> {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::PRIMARY,
+                ..Default::default()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                })
+                .await
+                .context("failed to request a preferred wgpu adapter for demo auto-detect")?;
+            let info = adapter.get_info();
+            Ok(Self {
+                vendor: classify_demo_gpu_vendor(info.vendor, &info.name),
+                adapter_name: info.name,
+                vendor_id: info.vendor,
+                backend: info.backend,
+                device_type: info.device_type,
+            })
+        }
+
+        fn describe(&self) -> String {
+            let vendor_name = match self.vendor {
+                DemoGpuVendor::Nvidia => "NVIDIA",
+                DemoGpuVendor::Amd => "AMD",
+                DemoGpuVendor::Unknown => "unknown",
+            };
+            format!(
+                "{vendor_name} adapter {} (vendor={} / 0x{:04x}, backend={:?}, device_type={:?})",
+                self.adapter_name,
+                vendor_name,
+                self.vendor_id,
+                self.backend,
+                self.device_type
+            )
+        }
+    }
+
     impl DemoCodec {
         fn parse(value: &str) -> Result<Self> {
             match value {
@@ -91,9 +183,15 @@ mod demo {
             }
         }
 
-        #[cfg(all(
-            feature = "nvenc-direct",
-            any(target_os = "linux", target_os = "windows")
+        #[cfg(any(
+            all(
+                feature = "nvenc-direct",
+                any(target_os = "linux", target_os = "windows")
+            ),
+            all(
+                feature = "gstreamer-fallback",
+                any(target_os = "linux", target_os = "windows")
+            )
         ))]
         fn display_name(self) -> &'static str {
             match self {
@@ -135,6 +233,11 @@ mod demo {
     enum DemoBackend {
         #[cfg(target_os = "macos")]
         VideoToolbox,
+        #[cfg(all(
+            feature = "gstreamer-fallback",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        GstreamerFallback { backend: GStreamerBackend },
         #[cfg(all(
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
@@ -186,7 +289,7 @@ mod demo {
                     }
                     "--help" | "-h" => {
                         anyhow::bail!(
-                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct] [-- --nvenc-device <ordinal> --codec <hevc|av1>]"
+                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct,gstreamer-fallback] [-- --nvenc-device <ordinal> --codec <hevc|av1>]"
                         );
                     }
                     other => {
@@ -201,81 +304,105 @@ mod demo {
     }
 
     impl DemoBackend {
+        #[cfg(target_os = "macos")]
         fn select(options: DemoOptions) -> Result<Self> {
-            #[cfg(target_os = "macos")]
-            {
-                if options.codec_override == Some(DemoCodec::Av1) {
-                    anyhow::bail!(
-                        "ustreamer-demo on macOS currently supports `--codec hevc` only; AV1 is not wired into the VideoToolbox demo path yet"
-                    );
-                }
-                return Ok(Self::VideoToolbox);
-            }
-            #[cfg(all(
-                feature = "nvenc-direct",
-                any(target_os = "linux", target_os = "windows")
-            ))]
-            {
-                let supported_codecs = NvencEncoder::supported_codecs_for_cuda_device(
-                    options.nvenc_device,
-                    NvencInputFormat::Bgra8,
-                )
-                .map_err(|error| {
-                    anyhow!(
-                        "failed to probe NVENC codec support on CUDA device {}: {error}",
-                        options.nvenc_device
-                    )
-                })?
-                .into_iter()
-                .map(DemoCodec::from_nvenc)
-                .collect::<Vec<_>>();
-                let codec = resolve_demo_codec(options.codec_override, &supported_codecs).map_err(
-                    |error| {
-                        anyhow!(
-                            "failed to select NVENC codec for CUDA device {}: {error}",
-                            options.nvenc_device
-                        )
-                    },
-                )?;
-                if let Some(requested_codec) = options.codec_override {
-                    info!(
-                        "Using requested NVENC codec {} on CUDA device {}.",
-                        requested_codec.display_name(),
-                        options.nvenc_device
-                    );
-                } else {
-                    info!(
-                        "Auto-selected NVENC codec {} on CUDA device {} (supported: {}).",
-                        codec.display_name(),
-                        options.nvenc_device,
-                        format_demo_codecs(&supported_codecs)
-                    );
-                }
-                return Ok(Self::NvencDirect {
-                    cuda_device: options.nvenc_device,
-                    codec,
-                });
-            }
-            #[cfg(all(
-                any(target_os = "linux", target_os = "windows"),
-                not(feature = "nvenc-direct")
-            ))]
-            {
+            if options.codec_override == Some(DemoCodec::Av1) {
                 anyhow::bail!(
-                    "ustreamer-demo on {} requires the `nvenc-direct` feature; run `cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device {} --codec {}`",
-                    env::consts::OS,
-                    options.nvenc_device,
-                    options.codec_override.unwrap_or(DemoCodec::Hevc).arg_name()
+                    "ustreamer-demo on macOS currently supports `--codec hevc` only; AV1 is not wired into the VideoToolbox demo path yet"
                 );
             }
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-            anyhow::bail!("ustreamer-demo is not supported on {}", env::consts::OS);
+            Ok(Self::VideoToolbox)
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        fn select(
+            options: DemoOptions,
+            graphics_probe: Option<&DemoGraphicsProbe>,
+        ) -> Result<Self> {
+            let detected_vendor = graphics_probe
+                .map(|probe| probe.vendor)
+                .unwrap_or(DemoGpuVendor::Unknown);
+            let detected_hardware = graphics_probe
+                .map(|probe| probe.describe())
+                .unwrap_or_else(|| format!("{} host", env::consts::OS));
+            let mut errors = Vec::new();
+
+            match detected_vendor {
+                DemoGpuVendor::Amd => {
+                    #[cfg(feature = "gstreamer-fallback")]
+                    match try_select_gstreamer_backend(options, graphics_probe) {
+                        Ok(backend) => return Ok(backend),
+                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                    }
+                    #[cfg(feature = "nvenc-direct")]
+                    match try_select_nvenc_backend(options, graphics_probe) {
+                        Ok(backend) => {
+                            warn!(
+                                "Detected AMD hardware ({detected_hardware}) but the GStreamer fallback path was unavailable. Using NVENC path instead."
+                            );
+                            return Ok(backend);
+                        }
+                        Err(error) => errors.push(format!("NVENC: {error:#}")),
+                    }
+                }
+                DemoGpuVendor::Nvidia => {
+                    #[cfg(feature = "nvenc-direct")]
+                    match try_select_nvenc_backend(options, graphics_probe) {
+                        Ok(backend) => return Ok(backend),
+                        Err(error) => errors.push(format!("NVENC: {error:#}")),
+                    }
+                    #[cfg(feature = "gstreamer-fallback")]
+                    match try_select_gstreamer_backend(options, graphics_probe) {
+                        Ok(backend) => {
+                            warn!(
+                                "Detected NVIDIA hardware ({detected_hardware}) but the direct NVENC path was unavailable. Falling back to GStreamer."
+                            );
+                            return Ok(backend);
+                        }
+                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                    }
+                }
+                DemoGpuVendor::Unknown => {
+                    #[cfg(feature = "nvenc-direct")]
+                    match try_select_nvenc_backend(options, graphics_probe) {
+                        Ok(backend) => return Ok(backend),
+                        Err(error) => errors.push(format!("NVENC: {error:#}")),
+                    }
+                    #[cfg(feature = "gstreamer-fallback")]
+                    match try_select_gstreamer_backend(options, graphics_probe) {
+                        Ok(backend) => return Ok(backend),
+                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                    }
+                }
+            }
+
+            if errors.is_empty() {
+                anyhow::bail!(
+                    "ustreamer-demo on {} requires either the `nvenc-direct` or `gstreamer-fallback` feature; run `cargo run -p ustreamer-demo --features gstreamer-fallback -- --codec hevc` for AMD/other GPUs or enable `nvenc-direct` for NVIDIA",
+                    env::consts::OS,
+                );
+            }
+
+            anyhow::bail!(
+                "failed to auto-select a demo backend for {detected_hardware}: {}",
+                errors.join(" | ")
+            );
         }
 
         fn description(self) -> String {
             match self {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => "VideoToolbox HEVC + staging capture".into(),
+                #[cfg(all(
+                    feature = "gstreamer-fallback",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::GstreamerFallback { backend } => {
+                    format!(
+                        "GStreamer {} fallback + staging capture",
+                        backend.display_name()
+                    )
+                }
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -291,6 +418,11 @@ mod demo {
             match self {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => wgpu::Backends::PRIMARY,
+                #[cfg(all(
+                    feature = "gstreamer-fallback",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::GstreamerFallback { .. } => wgpu::Backends::PRIMARY,
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -312,6 +444,11 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Box::new(StagingCapture::new(3)),
                 #[cfg(all(
+                    feature = "gstreamer-fallback",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::GstreamerFallback { .. } => Box::new(StagingCapture::new(3)),
+                #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
@@ -329,6 +466,18 @@ mod demo {
             match self {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Ok(Box::new(VideoToolboxEncoder::new())),
+                #[cfg(all(
+                    feature = "gstreamer-fallback",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::GstreamerFallback { backend } => GStreamerEncoder::new()
+                    .map(|encoder| Box::new(encoder) as Box<dyn FrameEncoder>)
+                    .map_err(|error| {
+                        anyhow!(
+                            "failed to create {} GStreamer fallback encoder: {error}",
+                            backend.display_name()
+                        )
+                    }),
                 #[cfg(all(feature = "nvenc-direct", any(target_os = "linux", target_os = "windows")))]
                 Self::NvencDirect { cuda_device, codec } => NvencEncoder::with_config_and_cuda_device(
                     NvencEncoderConfig {
@@ -352,6 +501,11 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Ok(DemoCaptureMode::Standard),
                 #[cfg(all(
+                    feature = "gstreamer-fallback",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::GstreamerFallback { .. } => Ok(DemoCaptureMode::Standard),
+                #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
@@ -370,6 +524,91 @@ mod demo {
                 }
             }
         }
+    }
+
+    #[cfg(all(
+        feature = "gstreamer-fallback",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn try_select_gstreamer_backend(
+        options: DemoOptions,
+        graphics_probe: Option<&DemoGraphicsProbe>,
+    ) -> Result<DemoBackend> {
+        if options.codec_override == Some(DemoCodec::Av1) {
+            anyhow::bail!(
+                "ustreamer-demo GStreamer fallback currently supports `--codec hevc` only; AV1 remains direct-NVENC only"
+            );
+        }
+
+        let probe_params = EncodeParams::default();
+        let plan = GStreamerPipelinePlan::probe_default(GStreamerCodec::Hevc, &probe_params)
+            .map_err(|error| anyhow!("failed to probe GStreamer fallback runtime: {error}"))?;
+        let detected_hardware = graphics_probe
+            .map(|probe| format!(" for {}", probe.describe()))
+            .unwrap_or_default();
+        info!(
+            "Auto-selected GStreamer fallback backend {} using encoder `{}`{}.",
+            plan.backend.display_name(),
+            plan.encoder_element,
+            detected_hardware
+        );
+        Ok(DemoBackend::GstreamerFallback {
+            backend: plan.backend,
+        })
+    }
+
+    #[cfg(all(
+        feature = "nvenc-direct",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn try_select_nvenc_backend(
+        options: DemoOptions,
+        graphics_probe: Option<&DemoGraphicsProbe>,
+    ) -> Result<DemoBackend> {
+        if let Some(probe) = graphics_probe {
+            info!(
+                "Trying direct NVENC path for detected {}.",
+                probe.describe()
+            );
+        }
+        let supported_codecs = NvencEncoder::supported_codecs_for_cuda_device(
+            options.nvenc_device,
+            NvencInputFormat::Bgra8,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to probe NVENC codec support on CUDA device {}: {error}",
+                options.nvenc_device
+            )
+        })?
+        .into_iter()
+        .map(DemoCodec::from_nvenc)
+        .collect::<Vec<_>>();
+        let codec =
+            resolve_demo_codec(options.codec_override, &supported_codecs).map_err(|error| {
+                anyhow!(
+                    "failed to select NVENC codec for CUDA device {}: {error}",
+                    options.nvenc_device
+                )
+            })?;
+        if let Some(requested_codec) = options.codec_override {
+            info!(
+                "Using requested NVENC codec {} on CUDA device {}.",
+                requested_codec.display_name(),
+                options.nvenc_device
+            );
+        } else {
+            info!(
+                "Auto-selected NVENC codec {} on CUDA device {} (supported: {}).",
+                codec.display_name(),
+                options.nvenc_device,
+                format_demo_codecs(&supported_codecs)
+            );
+        }
+        Ok(DemoBackend::NvencDirect {
+            cuda_device: options.nvenc_device,
+            codec,
+        })
     }
 
     #[cfg(all(
@@ -464,13 +703,26 @@ mod demo {
 
     pub fn run() -> Result<()> {
         let options = DemoOptions::parse().context("failed to parse demo options")?;
-        let backend = DemoBackend::select(options)?;
         let endpoints = LocalStreamEndpoints::default();
         let stream_addr = endpoints.stream;
         let http_addr = endpoints.http;
 
         let _http_thread = spawn_http_server(http_addr)?;
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let graphics_probe = Some(
+            runtime
+                .block_on(DemoGraphicsProbe::detect())
+                .context("failed to auto-detect the preferred demo GPU")?,
+        );
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(probe) = graphics_probe.as_ref() {
+            info!("Detected preferred demo GPU: {}.", probe.describe());
+        }
+        #[cfg(target_os = "macos")]
+        let backend = DemoBackend::select(options)?;
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let backend = DemoBackend::select(options, graphics_probe.as_ref())?;
 
         let sessions = Arc::new(Mutex::new(Vec::<SessionSlot>::new()));
         let session_counter = Arc::new(AtomicU64::new(1));
@@ -1421,7 +1673,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     #[cfg(test)]
     mod tests {
-        use super::{DEMO_SHADER, DemoCodec, DemoOptions, format_demo_codecs, resolve_demo_codec};
+        use super::{
+            DEMO_SHADER, DemoCodec, DemoGpuVendor, DemoOptions, classify_demo_gpu_vendor,
+            format_demo_codecs, resolve_demo_codec,
+        };
         #[cfg(all(
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
@@ -1484,6 +1739,30 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         fn rejects_unknown_demo_flag() {
             let error = DemoOptions::parse_from_iter(["--bogus"]).unwrap_err();
             assert!(error.to_string().contains("unrecognized argument"));
+        }
+
+        #[test]
+        fn classifies_known_gpu_vendors() {
+            assert_eq!(
+                classify_demo_gpu_vendor(0x10de, "RTX 4090"),
+                DemoGpuVendor::Nvidia
+            );
+            assert_eq!(
+                classify_demo_gpu_vendor(0x1002, "Radeon RX 6800 XT"),
+                DemoGpuVendor::Amd
+            );
+            assert_eq!(
+                classify_demo_gpu_vendor(0, "AMD Radeon Pro"),
+                DemoGpuVendor::Amd
+            );
+            assert_eq!(
+                classify_demo_gpu_vendor(0, "NVIDIA GeForce"),
+                DemoGpuVendor::Nvidia
+            );
+            assert_eq!(
+                classify_demo_gpu_vendor(0, "Some Other Adapter"),
+                DemoGpuVendor::Unknown
+            );
         }
 
         #[test]
