@@ -247,21 +247,18 @@ mod windows_probe {
             .context("CUDA external-memory import/wait failed")?;
         verify_descriptor_sync(&imported.sync, sync_mode, captured_sync_value)
             .context("CUDA-imported sync contract mismatch")?;
-        if imported.device_ptr == 0 {
-            bail!("CUDA import returned a null device pointer");
-        }
-        let minimum_len = imported.pitch_bytes as u64 * imported.height as u64;
-        if imported.mapped_len < minimum_len as usize {
+        if imported.resource_handle() == 0 {
             bail!(
-                "CUDA import mapped {} bytes, smaller than expected minimum {} bytes",
-                imported.mapped_len,
-                minimum_len
+                "CUDA import returned a null {} handle",
+                imported.resource_kind()
             );
         }
 
         println!(
-            "[pass] CUDA import succeeded: ptr=0x{:x}, pitch={} bytes, mapped_len={} bytes",
-            imported.device_ptr, imported.pitch_bytes, imported.mapped_len
+            "[pass] CUDA import succeeded: kind={}, handle=0x{:x}, pitch={} bytes",
+            imported.resource_kind(),
+            imported.resource_handle(),
+            imported.pitch_bytes
         );
         drop(imported);
 

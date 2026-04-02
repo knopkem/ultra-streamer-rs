@@ -2,7 +2,7 @@
 //!
 //! This module validates exported Vulkan frames, imports exported memory into
 //! CUDA, and now wires a first real NVENC session slice that registers the
-//! imported CUDA pointer per frame and reads back encoded HEVC/AV1 bitstreams.
+//! imported CUDA image per frame and reads back encoded HEVC/AV1 bitstreams.
 //! The conservative `HostSynchronized` handoff remains the default runtime path;
 //! HEVC output is normalized into length-prefixed access units with cached
 //! `hvcC` decoder config for browser-side WebCodecs consumption, while true
@@ -1203,11 +1203,11 @@ impl<T> NvencRegisteredResource<T> {
         let api = nvenc_api()?;
         let mut register_resource = NV_ENC_REGISTER_RESOURCE {
             version: NV_ENC_REGISTER_RESOURCE_VER,
-            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            resourceType: imported.resource_type(),
             width: descriptor.width,
             height: descriptor.height,
             pitch,
-            resourceToRegister: imported.device_ptr as *mut c_void,
+            resourceToRegister: imported.resource_to_register(),
             registeredResource: ptr::null_mut(),
             bufferFormat: descriptor.buffer_format(),
             ..Default::default()
@@ -1216,7 +1216,7 @@ impl<T> NvencRegisteredResource<T> {
         nvenc_encode_result(
             status,
             encoder,
-            "failed to register imported CUDA pointer with NVENC",
+            "failed to register imported CUDA image with NVENC",
         )?;
 
         let mut map_input = NV_ENC_MAP_INPUT_RESOURCE {
@@ -1287,14 +1287,20 @@ impl NvencCudaImporter {
     ) -> Result<NvencCudaImportedFrame, EncodeError> {
         let file = file_from_import_handle(image)?;
         let sync = import_cuda_sync(image.sync(), &self.ctx)?;
-        let mapped_buffer =
-            CudaExternalMemoryBuffer::import_dedicated(&self.ctx, file, image.allocation_size())
-                .map_err(|error| {
-                    EncodeError::EncodeFailed(format!(
-                        "CUDA external-memory import failed for resource {}: {error}",
-                        prepared.input.resource_id
-                    ))
-                })?;
+        let mapped_array = CudaExternalMemoryArray::import_dedicated(
+            &self.ctx,
+            file,
+            prepared.input.width,
+            prepared.input.height,
+            prepared.input.format,
+            image.allocation_size(),
+        )
+        .map_err(|error| {
+            EncodeError::EncodeFailed(format!(
+                "CUDA external-memory import failed for resource {}: {error}",
+                prepared.input.resource_id
+            ))
+        })?;
         let stream = self.ctx.default_stream();
         sync.wait(&stream).map_err(|error| {
             EncodeError::EncodeFailed(format!(
@@ -1304,15 +1310,15 @@ impl NvencCudaImporter {
         })?;
 
         Ok(NvencCudaImportedFrame {
-            device_ptr: mapped_buffer.device_ptr,
-            mapped_len: mapped_buffer.len(),
+            resource_type: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY,
+            resource_to_register: mapped_array.array() as *mut c_void,
             pitch_bytes: row_bytes_for_input(prepared.input.format, prepared.input.width)?,
             width: prepared.input.width,
             height: prepared.input.height,
             format: prepared.input.format,
             sync: prepared.sync.clone(),
             _cuda_sync: sync,
-            _mapped_buffer: mapped_buffer,
+            _mapped_array: mapped_array,
         })
     }
 }
@@ -1320,15 +1326,40 @@ impl NvencCudaImporter {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Debug)]
 pub struct NvencCudaImportedFrame {
-    pub device_ptr: u64,
-    pub mapped_len: usize,
+    resource_type: NV_ENC_INPUT_RESOURCE_TYPE,
+    resource_to_register: *mut c_void,
     pub pitch_bytes: u32,
     pub width: u32,
     pub height: u32,
     pub format: NvencInputFormat,
     pub sync: NvencExternalSyncDescriptor,
     _cuda_sync: NvencCudaSync,
-    _mapped_buffer: CudaExternalMemoryBuffer,
+    _mapped_array: CudaExternalMemoryArray,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NvencCudaImportedFrame {
+    fn resource_type(&self) -> NV_ENC_INPUT_RESOURCE_TYPE {
+        self.resource_type
+    }
+
+    fn resource_to_register(&self) -> *mut c_void {
+        self.resource_to_register
+    }
+
+    pub fn resource_kind(&self) -> &'static str {
+        match self.resource_type {
+            NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDAARRAY => "cuda-array",
+            NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR => {
+                "cuda-device-ptr"
+            }
+            _ => "cuda-resource",
+        }
+    }
+
+    pub fn resource_handle(&self) -> usize {
+        self.resource_to_register as usize
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1340,45 +1371,78 @@ impl AsRef<NvencCudaImportedFrame> for NvencCudaImportedFrame {
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 #[derive(Debug)]
-struct CudaExternalMemoryBuffer {
-    device_ptr: u64,
-    len: usize,
+struct CudaExternalMemoryArray {
+    array: sys::CUarray,
+    mipmapped_array: sys::CUmipmappedArray,
     external_memory: sys::CUexternalMemory,
     ctx: Arc<CudaContext>,
     _file: ManuallyDrop<File>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-impl CudaExternalMemoryBuffer {
+impl CudaExternalMemoryArray {
     fn import_dedicated(
         ctx: &Arc<CudaContext>,
         file: File,
+        width: u32,
+        height: u32,
+        format: NvencInputFormat,
         size: u64,
     ) -> Result<Self, CudaDriverError> {
         ctx.bind_to_thread()?;
         let external_memory = unsafe { import_external_memory_dedicated(&file, size) }?;
-        let device_ptr =
-            unsafe { result::external_memory::get_mapped_buffer(external_memory, 0, size) }?;
+        let mut mipmapped_array = ptr::null_mut();
+        let array_desc = cuda_array_descriptor(format, width, height);
+        let mipmapped_array_desc = sys::CUDA_EXTERNAL_MEMORY_MIPMAPPED_ARRAY_DESC {
+            offset: 0,
+            arrayDesc: array_desc,
+            numLevels: 1,
+            reserved: [0; 16],
+        };
+        if let Err(error) = unsafe {
+            sys::cuExternalMemoryGetMappedMipmappedArray(
+                &mut mipmapped_array,
+                external_memory,
+                &mipmapped_array_desc,
+            )
+        }
+        .result()
+        {
+            unsafe {
+                let _ = result::external_memory::destroy_external_memory(external_memory);
+            }
+            return Err(error);
+        }
+        let mut array = ptr::null_mut();
+        if let Err(error) =
+            unsafe { sys::cuMipmappedArrayGetLevel(&mut array, mipmapped_array, 0) }.result()
+        {
+            unsafe {
+                let _ = sys::cuMipmappedArrayDestroy(mipmapped_array);
+                let _ = result::external_memory::destroy_external_memory(external_memory);
+            }
+            return Err(error);
+        }
         Ok(Self {
-            device_ptr,
-            len: size as usize,
+            array,
+            mipmapped_array,
             external_memory,
             ctx: ctx.clone(),
             _file: ManuallyDrop::new(file),
         })
     }
 
-    fn len(&self) -> usize {
-        self.len
+    fn array(&self) -> sys::CUarray {
+        self.array
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-impl Drop for CudaExternalMemoryBuffer {
+impl Drop for CudaExternalMemoryArray {
     fn drop(&mut self) {
         let _ = self.ctx.bind_to_thread();
         unsafe {
-            let _ = result::memory_free(self.device_ptr);
+            let _ = sys::cuMipmappedArrayDestroy(self.mipmapped_array);
             let _ = result::external_memory::destroy_external_memory(self.external_memory);
         }
         #[cfg(target_os = "windows")]
@@ -1610,6 +1674,39 @@ fn row_bytes_for_input(format: NvencInputFormat, width: u32) -> Result<u32, Enco
             "NVENC input row-bytes overflow for width {width} and format {format:?}"
         ))
     })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cuda_array_descriptor(
+    format: NvencInputFormat,
+    width: u32,
+    height: u32,
+) -> sys::CUDA_ARRAY3D_DESCRIPTOR {
+    sys::CUDA_ARRAY3D_DESCRIPTOR {
+        Width: width as usize,
+        Height: height as usize,
+        // CUDA external-memory interop expects 2D images to use Depth = 0.
+        Depth: 0,
+        Format: cuda_array_format(format),
+        NumChannels: cuda_array_num_channels(format),
+        Flags: 0,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cuda_array_format(format: NvencInputFormat) -> sys::CUarray_format {
+    match format {
+        NvencInputFormat::Bgra8 | NvencInputFormat::Rgba8 => {
+            sys::CUarray_format::CU_AD_FORMAT_UNSIGNED_INT8
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn cuda_array_num_channels(format: NvencInputFormat) -> u32 {
+    match format {
+        NvencInputFormat::Bgra8 | NvencInputFormat::Rgba8 => 4,
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2078,6 +2175,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::fs::File;
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use cudarc::driver::sys;
     #[cfg(target_os = "linux")]
     use ustreamer_capture::{VulkanExternalImage, VulkanExternalMemoryHandle};
     #[cfg(target_os = "linux")]
@@ -2086,8 +2185,8 @@ mod tests {
 
     use super::{
         HEVC_HVCC_LENGTH_SIZE_MINUS_ONE, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS,
-        NvencEncoder, NvencInputFormat, build_hevc_hvcc_description, extract_hevc_parameter_sets,
-        normalize_hevc_access_unit,
+        NvencEncoder, NvencInputFormat, build_hevc_hvcc_description, cuda_array_descriptor,
+        extract_hevc_parameter_sets, normalize_hevc_access_unit,
     };
     #[cfg(target_os = "linux")]
     use super::{NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor};
@@ -2170,6 +2269,22 @@ mod tests {
             rgba.buffer_format(),
             NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
         );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn builds_2d_cuda_array_descriptor_for_rgba_images() {
+        let descriptor = cuda_array_descriptor(NvencInputFormat::Bgra8, 1280, 720);
+
+        assert_eq!(descriptor.Width, 1280);
+        assert_eq!(descriptor.Height, 720);
+        assert_eq!(descriptor.Depth, 0);
+        assert_eq!(
+            descriptor.Format,
+            sys::CUarray_format::CU_AD_FORMAT_UNSIGNED_INT8
+        );
+        assert_eq!(descriptor.NumChannels, 4);
+        assert_eq!(descriptor.Flags, 0);
     }
 
     #[test]
