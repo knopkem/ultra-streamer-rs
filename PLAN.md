@@ -31,12 +31,13 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** feature-gated direct-NVENC encode path that validates exported Vulkan frames, translates them into explicit external-memory/rate-control/sync descriptors, imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory via `cudarc`, and wires a first real NVENC session/resource-registration/bitstream-output slice
 - **Implemented:** the direct NVENC path now loads NVENC API entrypoints from the driver runtime instead of depending on Windows SDK import libraries, removing the Windows/MSVC linker dependency on `nvEncodeAPI.lib`
 - **Implemented:** a stripped vendored local NVENC raw-binding crate now backs `ustreamer-encode`, so the Windows build no longer depends on the upstream crate's safe helper module or NVDEC/CUVID bindings
-- **Implemented:** Windows-focused `ustreamer-nvenc-probe` binary that forces `wgpu` Vulkan, uploads a known test texture, exercises `HostSynchronized` plus optional exported timeline semaphore capture, validates CUDA import/wait, and confirms the current encode placeholder boundary on real NVIDIA hosts
+- **Implemented:** Windows-focused `ustreamer-nvenc-probe` binary that forces `wgpu` Vulkan, uploads a known test texture, exercises `HostSynchronized` plus optional exported timeline semaphore capture, validates CUDA import/wait, and now confirms real NVENC HEVC output on a Windows RTX 2070 host
 - **Implemented:** Windows `OPAQUE_WIN32` handle export now requests explicit read/write access rights for CUDA interop, and the probe now reports missing external-semaphore-export support as a skip instead of a hard failure
 - **Implemented:** direct CUDA external-memory import now uses an explicit dedicated-allocation descriptor for exported Vulkan image memory instead of relying on `cudarc`'s generic `flags = 0` helper
 - **Validated:** real Windows RTX 2070 runtime probe now passes for `HostSynchronized` Vulkan external-memory export → CUDA import; `ExportedTimelineSemaphore` remains skipped because the current `wgpu` Vulkan device does not enable `VK_KHR_external_semaphore_win32`
 - **Implemented:** multi-client demo broadcast over WebSocket with per-viewer initialization and forced keyframes for newly joined viewers
-- **Next up:** validate the new real NVENC bitstream-output slice on the Windows RTX 2070 probe host, then replace the conservative host-side wait with a true GPU-driven handoff and add decoder-config extraction plus backend-specific true-lossless refine where supported
+- **Implemented:** the direct NVENC HEVC path now queries sequence parameters from NVENC, builds browser-ready `hvcC` decoder config, and normalizes HEVC access units into the same length-prefixed format already consumed by the WebCodecs client
+- **Next up:** replace the conservative host-side wait with a true GPU-driven handoff, add AV1 decoder-config extraction, and wire backend-specific true-lossless refine where supported
 
 ---
 

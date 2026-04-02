@@ -4,8 +4,10 @@
 //! CUDA, and now wires a first real NVENC session slice that registers the
 //! imported CUDA pointer per frame and reads back encoded HEVC/AV1 bitstreams.
 //! The conservative `HostSynchronized` handoff remains the default runtime path;
-//! decoder-config extraction, true GPU-driven semaphore handoff, and
-//! backend-specific true-lossless refinement are still pending.
+//! HEVC output is normalized into length-prefixed access units with cached
+//! `hvcC` decoder config for browser-side WebCodecs consumption, while true
+//! GPU-driven semaphore handoff, AV1 decoder-config extraction, and
+//! backend-specific true-lossless refinement remain pending.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -39,9 +41,9 @@ use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_OUTPUT_PTR, NV_ENC_PARAMS_RC_MODE,
     NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
     NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
-    NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_TUNING_INFO,
-    NV_ENCODE_API_FUNCTION_LIST, NV_ENCODE_API_FUNCTION_LIST_VER, NVENCAPI_MAJOR_VERSION,
-    NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NVENCSTATUS,
+    NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_SEQUENCE_PARAM_PAYLOAD,
+    NV_ENC_TUNING_INFO, NV_ENCODE_API_FUNCTION_LIST, NV_ENCODE_API_FUNCTION_LIST_VER,
+    NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NVENCSTATUS,
 };
 use ustreamer_capture::{
     CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
@@ -53,6 +55,13 @@ use crate::{DecoderConfig, EncodeError, EncodedFrame, FrameEncoder};
 
 const DEFAULT_HEVC_CODEC: &str = "hvc1.1.6.L153.B0";
 const DEFAULT_AV1_CODEC: &str = "av01.0.08M.08";
+const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = NVENCAPI_VERSION | (1 << 16) | (0x7 << 28);
+const HEVC_NAL_TYPE_VPS: u8 = 32;
+const HEVC_NAL_TYPE_SPS: u8 = 33;
+const HEVC_NAL_TYPE_PPS: u8 = 34;
+const HEVC_ACCESS_UNIT_LENGTH_BYTES: usize = 4;
+const HEVC_HVCC_LENGTH_SIZE_MINUS_ONE: u8 = (HEVC_ACCESS_UNIT_LENGTH_BYTES - 1) as u8;
+const NVENC_SEQUENCE_PAYLOAD_BUFFER_SIZE: usize = 4096;
 
 #[cfg(target_os = "windows")]
 const NVENC_RUNTIME_LIBRARY_CANDIDATES: &[&str] = &["nvEncodeAPI64.dll", "nvEncodeAPI.dll"];
@@ -274,6 +283,17 @@ impl NvencApi {
             .expect(NVENC_API_MSG))(
             encoder, codec_guid, preset_guid, tuning_info, preset_config
         )
+    }
+
+    unsafe fn get_sequence_params(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_SEQUENCE_PARAM_PAYLOAD,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncGetSequenceParams
+            .expect(NVENC_API_MSG))(encoder, params)
     }
 
     unsafe fn get_last_error_string(&self, encoder: *mut c_void) -> *const i8 {
@@ -585,7 +605,7 @@ impl NvencEncoder {
             })?
             .context()
             .clone();
-        let runtime = NvencRuntimeSession::create(ctx, prepared)?;
+        let runtime = NvencRuntimeSession::create(ctx, prepared, self.codec_string())?;
         self.nvenc_session = Some(NvencSessionState {
             runtime,
             next_input_timestamp: 0,
@@ -651,6 +671,9 @@ impl FrameEncoder for NvencEncoder {
     fn decoder_config(&self) -> Option<DecoderConfig> {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         if let Some(session) = &self.nvenc_session {
+            if let Some(config) = session.runtime.decoder_config() {
+                return Some(config.clone());
+            }
             return Some(DecoderConfig {
                 codec: self.codec_string().to_owned(),
                 description: None,
@@ -823,6 +846,8 @@ struct NvencRuntimeSession {
     encoder: *mut c_void,
     output_bitstream: NV_ENC_OUTPUT_PTR,
     descriptor: NvencSessionDescriptor,
+    codec_string: String,
+    decoder_config: Option<DecoderConfig>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -830,7 +855,11 @@ unsafe impl Send for NvencRuntimeSession {}
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NvencRuntimeSession {
-    fn create(ctx: Arc<CudaContext>, prepared: &NvencPreparedFrame) -> Result<Self, EncodeError> {
+    fn create(
+        ctx: Arc<CudaContext>,
+        prepared: &NvencPreparedFrame,
+        codec_string: &str,
+    ) -> Result<Self, EncodeError> {
         let descriptor = NvencSessionDescriptor::from_prepared(prepared);
         ctx.bind_to_thread().map_err(|error| {
             EncodeError::InitFailed(format!(
@@ -843,14 +872,21 @@ impl NvencRuntimeSession {
             encoder: ptr::null_mut(),
             output_bitstream: ptr::null_mut(),
             descriptor,
+            codec_string: codec_string.to_owned(),
+            decoder_config: None,
         };
         session.open_encode_session()?;
         session.initialize_encoder()?;
+        session.decoder_config = session.query_decoder_config()?;
         Ok(session)
     }
 
     fn descriptor(&self) -> &NvencSessionDescriptor {
         &self.descriptor
+    }
+
+    fn decoder_config(&self) -> Option<&DecoderConfig> {
+        self.decoder_config.as_ref()
     }
 
     fn open_encode_session(&mut self) -> Result<(), EncodeError> {
@@ -938,6 +974,68 @@ impl NvencRuntimeSession {
         Ok(())
     }
 
+    fn query_decoder_config(&self) -> Result<Option<DecoderConfig>, EncodeError> {
+        match self.descriptor.codec {
+            NvencCodec::Hevc => Ok(Some(self.query_hevc_decoder_config()?)),
+            NvencCodec::Av1 => Ok(None),
+        }
+    }
+
+    fn query_hevc_decoder_config(&self) -> Result<DecoderConfig, EncodeError> {
+        let sequence_payload = self.query_sequence_payload()?;
+        let description = build_hevc_hvcc_description(&sequence_payload).map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to build HEVC decoder configuration from NVENC sequence parameters: {error}"
+            ))
+        })?;
+        Ok(DecoderConfig {
+            codec: self.codec_string.clone(),
+            description: Some(description),
+            coded_width: self.descriptor.width,
+            coded_height: self.descriptor.height,
+        })
+    }
+
+    fn query_sequence_payload(&self) -> Result<Vec<u8>, EncodeError> {
+        let api = nvenc_api()?;
+        let mut payload = vec![0u8; NVENC_SEQUENCE_PAYLOAD_BUFFER_SIZE];
+        let mut payload_size = 0u32;
+        let mut params = NV_ENC_SEQUENCE_PARAM_PAYLOAD {
+            version: NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER,
+            inBufferSize: payload.len().min(u32::MAX as usize) as u32,
+            spsId: 0,
+            ppsId: 0,
+            spsppsBuffer: payload.as_mut_ptr().cast::<c_void>(),
+            outSPSPPSPayloadSize: &mut payload_size,
+            ..Default::default()
+        };
+        let status = unsafe { api.get_sequence_params(self.encoder, &mut params) };
+        nvenc_init_result(
+            status,
+            self.encoder,
+            "failed to query NVENC sequence parameters",
+        )?;
+        let payload_len = payload_size as usize;
+        if payload_len == 0 {
+            return Err(EncodeError::InitFailed(
+                "NVENC returned an empty sequence-parameter payload".into(),
+            ));
+        }
+        payload.truncate(payload_len.min(payload.len()));
+        Ok(payload)
+    }
+
+    fn normalize_access_unit(&self, data: Vec<u8>) -> Result<Vec<u8>, EncodeError> {
+        match self.descriptor.codec {
+            NvencCodec::Hevc => normalize_hevc_access_unit(&data).map_err(|error| {
+                EncodeError::EncodeFailed(format!(
+                    "failed to normalize NVENC HEVC access unit for browser decode: {error}"
+                ))
+            }),
+            NvencCodec::Av1 => Ok(data),
+        }
+    }
+
     fn encode_imported_frame(
         &mut self,
         imported: NvencCudaImportedFrame,
@@ -991,9 +1089,10 @@ impl NvencRuntimeSession {
                 "NVENC encode completed but produced an empty output bitstream".into(),
             ));
         }
+        let bitstream = self.normalize_access_unit(output.data)?;
 
         Ok(EncodedFrame {
-            data: output.data,
+            data: bitstream,
             is_keyframe: matches!(
                 output.picture_type,
                 NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
@@ -1601,6 +1700,316 @@ fn clamp_u64_to_u32(value: u64) -> u32 {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HevcParameterSets {
+    vps: Vec<u8>,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HevcSpsMetadata {
+    general_profile_space: u8,
+    general_tier_flag: bool,
+    general_profile_idc: u8,
+    general_profile_compatibility_flags: u32,
+    general_constraint_indicator_flags: u64,
+    general_level_idc: u8,
+    chroma_format_idc: u8,
+    bit_depth_luma_minus8: u8,
+    bit_depth_chroma_minus8: u8,
+    num_temporal_layers: u8,
+    temporal_id_nested: bool,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_offset: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> Result<u8, String> {
+        self.read_bits(1).map(|value| value as u8)
+    }
+
+    fn read_bits(&mut self, bit_count: u8) -> Result<u64, String> {
+        let mut value = 0u64;
+        for _ in 0..bit_count {
+            if self.bit_offset >= self.data.len().saturating_mul(8) {
+                return Err("unexpected end of HEVC RBSP".into());
+            }
+            let byte = self.data[self.bit_offset / 8];
+            let shift = 7 - (self.bit_offset % 8);
+            value = (value << 1) | u64::from((byte >> shift) & 1);
+            self.bit_offset += 1;
+        }
+        Ok(value)
+    }
+
+    fn read_ue(&mut self) -> Result<u32, String> {
+        let mut leading_zero_bits = 0u32;
+        while self.read_bit()? == 0 {
+            leading_zero_bits = leading_zero_bits.saturating_add(1);
+            if leading_zero_bits > 31 {
+                return Err("HEVC Exp-Golomb value exceeds supported range".into());
+            }
+        }
+        let suffix = if leading_zero_bits == 0 {
+            0
+        } else {
+            self.read_bits(leading_zero_bits as u8)? as u32
+        };
+        Ok((1u32 << leading_zero_bits) - 1 + suffix)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn normalize_hevc_access_unit(data: &[u8]) -> Result<Vec<u8>, String> {
+    let nal_units = extract_annex_b_nalus(data);
+    if nal_units.is_empty() {
+        return Ok(data.to_vec());
+    }
+
+    let mut output = Vec::with_capacity(data.len());
+    for nal_unit in nal_units {
+        let length = u32::try_from(nal_unit.len())
+            .map_err(|_| "HEVC NAL unit exceeded 32-bit length field".to_string())?;
+        output.extend_from_slice(&length.to_be_bytes());
+        output.extend_from_slice(nal_unit);
+    }
+    Ok(output)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_hevc_hvcc_description(sequence_payload: &[u8]) -> Result<Vec<u8>, String> {
+    let parameter_sets = extract_hevc_parameter_sets(sequence_payload)?;
+    let metadata = parse_hevc_sps_metadata(&parameter_sets.sps)?;
+
+    let mut description = Vec::with_capacity(
+        23 + parameter_sets.vps.len() + parameter_sets.sps.len() + parameter_sets.pps.len() + 18,
+    );
+    description.push(1);
+    description.push(
+        ((metadata.general_profile_space & 0x03) << 6)
+            | (u8::from(metadata.general_tier_flag) << 5)
+            | (metadata.general_profile_idc & 0x1f),
+    );
+    description.extend_from_slice(&metadata.general_profile_compatibility_flags.to_be_bytes());
+    description.extend_from_slice(&metadata.general_constraint_indicator_flags.to_be_bytes()[2..]);
+    description.push(metadata.general_level_idc);
+    description.extend_from_slice(&0xF000u16.to_be_bytes());
+    description.push(0xFC);
+    description.push(0xFC | (metadata.chroma_format_idc & 0x03));
+    description.push(0xF8 | (metadata.bit_depth_luma_minus8 & 0x07));
+    description.push(0xF8 | (metadata.bit_depth_chroma_minus8 & 0x07));
+    description.extend_from_slice(&0u16.to_be_bytes());
+    description.push(
+        ((metadata.num_temporal_layers.max(1).min(7) & 0x07) << 3)
+            | (u8::from(metadata.temporal_id_nested) << 2)
+            | (HEVC_HVCC_LENGTH_SIZE_MINUS_ONE & 0x03),
+    );
+    description.push(3);
+    append_hvcc_array(&mut description, HEVC_NAL_TYPE_VPS, &parameter_sets.vps);
+    append_hvcc_array(&mut description, HEVC_NAL_TYPE_SPS, &parameter_sets.sps);
+    append_hvcc_array(&mut description, HEVC_NAL_TYPE_PPS, &parameter_sets.pps);
+    Ok(description)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn append_hvcc_array(description: &mut Vec<u8>, nal_type: u8, nal_unit: &[u8]) {
+    description.push(0x80 | (nal_type & 0x3f));
+    description.extend_from_slice(&1u16.to_be_bytes());
+    description.extend_from_slice(&(nal_unit.len().min(u16::MAX as usize) as u16).to_be_bytes());
+    description.extend_from_slice(nal_unit);
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn extract_hevc_parameter_sets(sequence_payload: &[u8]) -> Result<HevcParameterSets, String> {
+    let mut vps = None;
+    let mut sps = None;
+    let mut pps = None;
+
+    for nal_unit in extract_annex_b_nalus(sequence_payload) {
+        let Some(nal_type) = hevc_nal_type(nal_unit) else {
+            continue;
+        };
+        match nal_type {
+            HEVC_NAL_TYPE_VPS if vps.is_none() => vps = Some(nal_unit.to_vec()),
+            HEVC_NAL_TYPE_SPS if sps.is_none() => sps = Some(nal_unit.to_vec()),
+            HEVC_NAL_TYPE_PPS if pps.is_none() => pps = Some(nal_unit.to_vec()),
+            _ => {}
+        }
+    }
+
+    Ok(HevcParameterSets {
+        vps: vps.ok_or_else(|| {
+            "NVENC sequence payload did not contain a HEVC VPS NAL unit".to_string()
+        })?,
+        sps: sps.ok_or_else(|| {
+            "NVENC sequence payload did not contain a HEVC SPS NAL unit".to_string()
+        })?,
+        pps: pps.ok_or_else(|| {
+            "NVENC sequence payload did not contain a HEVC PPS NAL unit".to_string()
+        })?,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn hevc_nal_type(nal_unit: &[u8]) -> Option<u8> {
+    nal_unit.first().map(|byte| (byte >> 1) & 0x3f)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn extract_annex_b_nalus(data: &[u8]) -> Vec<&[u8]> {
+    let mut nal_units = Vec::new();
+    let mut search_from = 0usize;
+
+    while let Some((start_code_offset, start_code_len)) = find_annex_b_start_code(data, search_from)
+    {
+        let nal_start = start_code_offset + start_code_len;
+        let next_start = find_annex_b_start_code(data, nal_start)
+            .map(|(offset, _)| offset)
+            .unwrap_or(data.len());
+        let mut nal_end = next_start;
+        while nal_end > nal_start && data[nal_end - 1] == 0 {
+            nal_end -= 1;
+        }
+        if nal_end > nal_start {
+            nal_units.push(&data[nal_start..nal_end]);
+        }
+        search_from = next_start;
+    }
+
+    nal_units
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn find_annex_b_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut index = from;
+    while index + 3 <= data.len() {
+        if data[index] == 0 && data[index + 1] == 0 {
+            if data.get(index + 2) == Some(&1) {
+                return Some((index, 3));
+            }
+            if data.get(index + 2) == Some(&0) && data.get(index + 3) == Some(&1) {
+                return Some((index, 4));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_hevc_sps_metadata(sps_nal_unit: &[u8]) -> Result<HevcSpsMetadata, String> {
+    if sps_nal_unit.len() < 3 {
+        return Err("HEVC SPS NAL unit was too short".into());
+    }
+    let rbsp = remove_emulation_prevention_bytes(&sps_nal_unit[2..]);
+    let mut bits = BitReader::new(&rbsp);
+
+    let _sps_video_parameter_set_id = bits.read_bits(4)?;
+    let sps_max_sub_layers_minus1 = bits.read_bits(3)? as u8;
+    let temporal_id_nested = bits.read_bit()? != 0;
+    let general_profile_space = bits.read_bits(2)? as u8;
+    let general_tier_flag = bits.read_bit()? != 0;
+    let general_profile_idc = bits.read_bits(5)? as u8;
+    let general_profile_compatibility_flags = bits.read_bits(32)? as u32;
+    let general_constraint_indicator_flags = bits.read_bits(48)?;
+    let general_level_idc = bits.read_bits(8)? as u8;
+
+    let mut sub_layer_profile_present_flags =
+        Vec::with_capacity(sps_max_sub_layers_minus1 as usize);
+    let mut sub_layer_level_present_flags = Vec::with_capacity(sps_max_sub_layers_minus1 as usize);
+    for _ in 0..sps_max_sub_layers_minus1 {
+        sub_layer_profile_present_flags.push(bits.read_bit()? != 0);
+        sub_layer_level_present_flags.push(bits.read_bit()? != 0);
+    }
+    if sps_max_sub_layers_minus1 > 0 {
+        for _ in sps_max_sub_layers_minus1..8 {
+            let _reserved_zero_2bits = bits.read_bits(2)?;
+        }
+    }
+    for (profile_present, level_present) in sub_layer_profile_present_flags
+        .into_iter()
+        .zip(sub_layer_level_present_flags.into_iter())
+    {
+        if profile_present {
+            let _sub_layer_profile_space = bits.read_bits(2)?;
+            let _sub_layer_tier_flag = bits.read_bit()?;
+            let _sub_layer_profile_idc = bits.read_bits(5)?;
+            let _sub_layer_profile_compatibility_flags = bits.read_bits(32)?;
+            let _sub_layer_constraint_indicator_flags = bits.read_bits(48)?;
+        }
+        if level_present {
+            let _sub_layer_level_idc = bits.read_bits(8)?;
+        }
+    }
+
+    let _sps_seq_parameter_set_id = bits.read_ue()?;
+    let chroma_format_idc = bits.read_ue()?.min(3) as u8;
+    if chroma_format_idc == 3 {
+        let _separate_colour_plane_flag = bits.read_bit()?;
+    }
+    let _pic_width_in_luma_samples = bits.read_ue()?;
+    let _pic_height_in_luma_samples = bits.read_ue()?;
+    let conformance_window_flag = bits.read_bit()? != 0;
+    if conformance_window_flag {
+        let _left = bits.read_ue()?;
+        let _right = bits.read_ue()?;
+        let _top = bits.read_ue()?;
+        let _bottom = bits.read_ue()?;
+    }
+    let bit_depth_luma_minus8 = bits.read_ue()?.min(7) as u8;
+    let bit_depth_chroma_minus8 = bits.read_ue()?.min(7) as u8;
+
+    Ok(HevcSpsMetadata {
+        general_profile_space,
+        general_tier_flag,
+        general_profile_idc,
+        general_profile_compatibility_flags,
+        general_constraint_indicator_flags,
+        general_level_idc,
+        chroma_format_idc,
+        bit_depth_luma_minus8,
+        bit_depth_chroma_minus8,
+        num_temporal_layers: sps_max_sub_layers_minus1.saturating_add(1),
+        temporal_id_nested,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn remove_emulation_prevention_bytes(data: &[u8]) -> Vec<u8> {
+    let mut rbsp = Vec::with_capacity(data.len());
+    let mut consecutive_zeros = 0u8;
+
+    for &byte in data {
+        if consecutive_zeros >= 2 && byte == 0x03 {
+            consecutive_zeros = 0;
+            continue;
+        }
+        rbsp.push(byte);
+        if byte == 0 {
+            consecutive_zeros = consecutive_zeros.saturating_add(1);
+        } else {
+            consecutive_zeros = 0;
+        }
+    }
+
+    rbsp
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn nvenc_init_result(
     status: NVENCSTATUS,
     encoder: *mut c_void,
@@ -1666,16 +2075,42 @@ fn nvenc_status_success(status: NVENCSTATUS) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::fs::File;
 
-    use ustreamer_capture::VulkanExternalMemoryHandle;
-    use ustreamer_proto::quality::{EncodeMode, EncodeParams};
+    #[cfg(target_os = "linux")]
+    use ustreamer_capture::{VulkanExternalImage, VulkanExternalMemoryHandle};
+    #[cfg(target_os = "linux")]
+    use ustreamer_proto::quality::EncodeMode;
+    use ustreamer_proto::quality::EncodeParams;
 
     use super::{
-        NvencEncoder, NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor,
-        NvencInputFormat,
+        HEVC_HVCC_LENGTH_SIZE_MINUS_ONE, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS,
+        NvencEncoder, NvencInputFormat, build_hevc_hvcc_description,
+        extract_hevc_parameter_sets, normalize_hevc_access_unit,
     };
-    use ustreamer_capture::{CapturedFrame, VulkanExternalImage};
+    #[cfg(target_os = "linux")]
+    use super::{NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor};
+    use ustreamer_capture::CapturedFrame;
+
+    fn sample_hevc_sequence_payload() -> Vec<u8> {
+        [
+            &[0x00, 0x00, 0x00, 0x01][..],
+            &[
+                0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00,
+                0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x5d, 0xac, 0x59,
+            ],
+            &[0x00, 0x00, 0x00, 0x01][..],
+            &[
+                0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0xb0, 0x00, 0x00, 0x03, 0x00,
+                0x00, 0x03, 0x00, 0x5d, 0xa0, 0x02, 0x80, 0x80, 0x2d, 0x16, 0x59, 0x59, 0xa4, 0x93,
+                0x2b, 0xc0, 0x5a, 0x02, 0x02, 0x02, 0x80,
+            ],
+            &[0x00, 0x00, 0x00, 0x01][..],
+            &[0x44, 0x01, 0xc1, 0x73, 0xd1, 0x89],
+        ]
+        .concat()
+    }
 
     #[test]
     fn rejects_non_vulkan_frames() {
@@ -1735,6 +2170,41 @@ mod tests {
             rgba.buffer_format(),
             NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR
         );
+    }
+
+    #[test]
+    fn normalizes_annex_b_hevc_access_units_to_length_prefixed() {
+        let normalized = normalize_hevc_access_unit(&[
+            0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0xaa, 0xbb, 0x00, 0x00, 0x01, 0x02, 0x01, 0xcc,
+        ])
+        .unwrap();
+
+        assert_eq!(
+            normalized,
+            vec![
+                0x00, 0x00, 0x00, 0x04, 0x26, 0x01, 0xaa, 0xbb, 0x00, 0x00, 0x00, 0x03, 0x02, 0x01,
+                0xcc,
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_hevc_parameter_sets_from_sequence_payload() {
+        let parameter_sets = extract_hevc_parameter_sets(&sample_hevc_sequence_payload()).unwrap();
+
+        assert_eq!((parameter_sets.vps[0] >> 1) & 0x3f, HEVC_NAL_TYPE_VPS);
+        assert_eq!((parameter_sets.sps[0] >> 1) & 0x3f, HEVC_NAL_TYPE_SPS);
+        assert_eq!((parameter_sets.pps[0] >> 1) & 0x3f, HEVC_NAL_TYPE_PPS);
+    }
+
+    #[test]
+    fn builds_hvcc_description_from_hevc_sequence_payload() {
+        let description = build_hevc_hvcc_description(&sample_hevc_sequence_payload()).unwrap();
+
+        assert_eq!(description[0], 1);
+        assert_eq!(description[21] & 0x03, HEVC_HVCC_LENGTH_SIZE_MINUS_ONE);
+        assert_eq!(description[22], 3);
+        assert_eq!(description[23], 0x80 | HEVC_NAL_TYPE_VPS);
     }
 
     #[cfg(target_os = "linux")]

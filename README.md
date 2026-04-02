@@ -118,7 +118,7 @@ What success means today:
 
 - `HostSynchronized` passing means Vulkan external-memory export, CUDA import, and at least one synchronous NVENC encode submission are working on that machine.
 - `ExportedTimelineSemaphore` passing means the current host-signaled external semaphore path also reaches the same encode boundary.
-- The probe currently validates raw encoded access-unit output only; decoder-config extraction for browser consumption is still a follow-up step.
+- The probe now validates real NVENC HEVC output on Windows, and the direct NVENC backend also caches `hvcC` decoder config plus normalizes HEVC access units into the length-prefixed format expected by the browser decode path. AV1 decoder-config extraction and GPU-driven semaphore handoff are still follow-up work.
 
 Windows note:
 
