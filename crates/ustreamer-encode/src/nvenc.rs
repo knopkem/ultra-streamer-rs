@@ -15,9 +15,11 @@ use std::os::windows::io::AsRawHandle;
 use std::{fs::File, mem::ManuallyDrop, sync::Arc};
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use cudarc::driver::safe::{CudaContext, DevicePtr, DeviceSlice, MappedBuffer};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-use cudarc::driver::{result::DriverError as CudaDriverError, sys};
+use cudarc::driver::{
+    result::{self, DriverError as CudaDriverError},
+    safe::CudaContext,
+    sys,
+};
 use ustreamer_capture::{
     CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
     VulkanExternalSyncHandle,
@@ -388,22 +390,14 @@ impl NvencCudaImporter {
     ) -> Result<NvencCudaImportedFrame, EncodeError> {
         let file = file_from_import_handle(image)?;
         let sync = import_cuda_sync(image.sync(), &self.ctx)?;
-        let external_memory = unsafe {
-            self.ctx
-                .import_external_memory(file, image.allocation_size())
-        }
-        .map_err(|error| {
-            EncodeError::EncodeFailed(format!(
-                "CUDA external-memory import failed for resource {}: {error}",
-                prepared.input.resource_id
-            ))
-        })?;
-        let mapped_buffer = external_memory.map_all().map_err(|error| {
-            EncodeError::EncodeFailed(format!(
-                "CUDA external-memory mapping failed for resource {}: {error}",
-                prepared.input.resource_id
-            ))
-        })?;
+        let mapped_buffer =
+            CudaExternalMemoryBuffer::import_dedicated(&self.ctx, file, image.allocation_size())
+                .map_err(|error| {
+                    EncodeError::EncodeFailed(format!(
+                        "CUDA external-memory import failed for resource {}: {error}",
+                        prepared.input.resource_id
+                    ))
+                })?;
         let stream = self.ctx.default_stream();
         sync.wait(&stream).map_err(|error| {
             EncodeError::EncodeFailed(format!(
@@ -411,14 +405,9 @@ impl NvencCudaImporter {
                 prepared.input.resource_id
             ))
         })?;
-        let device_ptr = {
-            let (device_ptr, sync) = mapped_buffer.device_ptr(&stream);
-            drop(sync);
-            device_ptr
-        };
 
         Ok(NvencCudaImportedFrame {
-            device_ptr,
+            device_ptr: mapped_buffer.device_ptr,
             mapped_len: mapped_buffer.len(),
             pitch_bytes: row_bytes_for_input(prepared.input.format, prepared.input.width)?,
             width: prepared.input.width,
@@ -442,7 +431,57 @@ pub struct NvencCudaImportedFrame {
     pub format: NvencInputFormat,
     pub sync: NvencExternalSyncDescriptor,
     _cuda_sync: NvencCudaSync,
-    _mapped_buffer: MappedBuffer,
+    _mapped_buffer: CudaExternalMemoryBuffer,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+struct CudaExternalMemoryBuffer {
+    device_ptr: u64,
+    len: usize,
+    external_memory: sys::CUexternalMemory,
+    ctx: Arc<CudaContext>,
+    _file: ManuallyDrop<File>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CudaExternalMemoryBuffer {
+    fn import_dedicated(
+        ctx: &Arc<CudaContext>,
+        file: File,
+        size: u64,
+    ) -> Result<Self, CudaDriverError> {
+        ctx.bind_to_thread()?;
+        let external_memory = unsafe { import_external_memory_dedicated(&file, size) }?;
+        let device_ptr =
+            unsafe { result::external_memory::get_mapped_buffer(external_memory, 0, size) }?;
+        Ok(Self {
+            device_ptr,
+            len: size as usize,
+            external_memory,
+            ctx: ctx.clone(),
+            _file: ManuallyDrop::new(file),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for CudaExternalMemoryBuffer {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        unsafe {
+            let _ = result::memory_free(self.device_ptr);
+            let _ = result::external_memory::destroy_external_memory(self.external_memory);
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            ManuallyDrop::drop(&mut self._file);
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -540,6 +579,53 @@ fn import_cuda_sync(
             NvencCudaSync::ExternalSemaphore(CudaExternalSemaphore::import(ctx, handle, *value)?),
         ),
     }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn import_external_memory_dedicated(
+    file: &File,
+    size: u64,
+) -> Result<sys::CUexternalMemory, CudaDriverError> {
+    use std::mem::MaybeUninit;
+
+    let mut external_memory = MaybeUninit::uninit();
+    let handle_description = sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+        type_: sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
+        handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 {
+            fd: file.as_raw_fd(),
+        },
+        size,
+        flags: sys::CUDA_EXTERNAL_MEMORY_DEDICATED,
+        reserved: [0; 16],
+    };
+    unsafe { sys::cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description) }
+        .result()?;
+    Ok(unsafe { external_memory.assume_init() })
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn import_external_memory_dedicated(
+    file: &File,
+    size: u64,
+) -> Result<sys::CUexternalMemory, CudaDriverError> {
+    use std::mem::MaybeUninit;
+
+    let mut external_memory = MaybeUninit::uninit();
+    let handle_description = sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+        type_: sys::CUexternalMemoryHandleType::CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32,
+        handle: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1 {
+            win32: sys::CUDA_EXTERNAL_MEMORY_HANDLE_DESC_st__bindgen_ty_1__bindgen_ty_1 {
+                handle: file.as_raw_handle(),
+                name: std::ptr::null(),
+            },
+        },
+        size,
+        flags: sys::CUDA_EXTERNAL_MEMORY_DEDICATED,
+        reserved: [0; 16],
+    };
+    unsafe { sys::cuImportExternalMemory(external_memory.as_mut_ptr(), &handle_description) }
+        .result()?;
+    Ok(unsafe { external_memory.assume_init() })
 }
 
 #[cfg(target_os = "linux")]

@@ -22,6 +22,9 @@ const EXPORT_TEXTURE_LABEL: &str = "ustreamer-vulkan-external";
 
 static NEXT_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(target_os = "windows")]
+const WIN32_SHARED_HANDLE_ACCESS: u32 = 0x8000_0000 | 0x4000_0000;
+
 /// Exported OS handle for a Vulkan external-memory allocation.
 #[derive(Debug)]
 pub enum VulkanExternalMemoryHandle {
@@ -183,6 +186,10 @@ struct CachedExportTexture {
     width: u32,
     height: u32,
     format: wgpu::TextureFormat,
+    #[cfg(target_os = "windows")]
+    exported_memory_handle: OwnedHandle,
+    #[cfg(target_os = "windows")]
+    exported_sync_handle: Option<OwnedHandle>,
     texture: wgpu::Texture,
 }
 
@@ -219,6 +226,37 @@ impl CachedExportTexture {
 
     fn next_sync_value(&self) -> u64 {
         self.next_sync_value.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[cfg(target_os = "windows")]
+    fn clone_memory_handle(&self) -> Result<VulkanExternalMemoryHandle, CaptureError> {
+        self.exported_memory_handle
+            .try_clone()
+            .map(VulkanExternalMemoryHandle::OpaqueWin32Handle)
+            .map_err(|error| {
+                CaptureError::VulkanInteropFailed(format!(
+                    "failed to clone cached exported Vulkan Win32 memory handle: {error}"
+                ))
+            })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn clone_sync_handle(&self) -> Result<VulkanExternalSyncHandle, CaptureError> {
+        self.exported_sync_handle
+            .as_ref()
+            .ok_or_else(|| {
+                CaptureError::VulkanInteropFailed(
+                    "cached export texture is missing its cached exported Win32 semaphore handle"
+                        .into(),
+                )
+            })?
+            .try_clone()
+            .map(VulkanExternalSyncHandle::OpaqueWin32Handle)
+            .map_err(|error| {
+                CaptureError::VulkanInteropFailed(format!(
+                    "failed to clone cached exported Vulkan Win32 semaphore handle: {error}"
+                ))
+            })
     }
 }
 
@@ -350,7 +388,10 @@ impl FrameCapture for VulkanExternalCapture {
         queue.submit(std::iter::once(encoder.finish()));
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
+        #[cfg(target_os = "linux")]
         let handle = export_memory_handle(instance, device, cached.device_memory)?;
+        #[cfg(target_os = "windows")]
+        let handle = cached.clone_memory_handle()?;
         let sync = match sync_mode {
             VulkanCaptureSyncMode::HostSynchronized => VulkanExternalSync::HostSynchronized,
             VulkanCaptureSyncMode::ExportedTimelineSemaphore => {
@@ -361,7 +402,10 @@ impl FrameCapture for VulkanExternalCapture {
                 })?;
                 let value = cached.next_sync_value();
                 signal_exported_timeline_semaphore(device, semaphore, value)?;
+                #[cfg(target_os = "linux")]
                 let handle = export_sync_handle(instance, device, semaphore)?;
+                #[cfg(target_os = "windows")]
+                let handle = cached.clone_sync_handle()?;
                 VulkanExternalSync::ExternalSemaphore { handle, value }
             }
         };
@@ -427,6 +471,7 @@ fn create_cached_export_texture(
         view_formats: &[],
     };
 
+    #[cfg(target_os = "linux")]
     let (image, memory, sync_semaphore, allocation_size, hal_texture) = {
         let instance_hal =
             unsafe {
@@ -488,7 +533,8 @@ fn create_cached_export_texture(
         let mut export_memory_info =
             vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
         #[cfg(target_os = "windows")]
-        let mut export_memory_win32_info = vk::ExportMemoryWin32HandleInfoKHR::default();
+        let mut export_memory_win32_info =
+            vk::ExportMemoryWin32HandleInfoKHR::default().dw_access(WIN32_SHARED_HANDLE_ACCESS);
         #[cfg(target_os = "linux")]
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -523,6 +569,17 @@ fn create_cached_export_texture(
 
         let sync_semaphore =
             create_exportable_timeline_semaphore(raw_instance, raw_device, sync_mode)?;
+        #[cfg(target_os = "windows")]
+        let exported_memory_handle = match export_memory_handle(instance, device, memory)? {
+            VulkanExternalMemoryHandle::OpaqueWin32Handle(handle) => handle,
+        };
+        #[cfg(target_os = "windows")]
+        let exported_sync_handle = match sync_semaphore {
+            Some(semaphore) => Some(match export_sync_handle(instance, device, semaphore)? {
+                VulkanExternalSyncHandle::OpaqueWin32Handle(handle) => handle,
+            }),
+            None => None,
+        };
 
         let drop_device = raw_device.clone();
         let drop_sync_semaphore = sync_semaphore;
@@ -545,11 +602,143 @@ fn create_cached_export_texture(
         )
     };
 
+    #[cfg(target_os = "windows")]
+    let (
+        image,
+        memory,
+        sync_semaphore,
+        allocation_size,
+        exported_memory_handle,
+        exported_sync_handle,
+        hal_texture,
+    ) = {
+        let instance_hal =
+            unsafe {
+                instance.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu instance is not using Vulkan"),
+                )?
+            };
+        let device_hal =
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu device is not using Vulkan"),
+                )?
+            };
+        ensure_external_memory_extension(device_hal.enabled_device_extensions())?;
+        if sync_mode == VulkanCaptureSyncMode::ExportedTimelineSemaphore {
+            ensure_external_semaphore_extension(device_hal.enabled_device_extensions())?;
+        }
+
+        let raw_instance = instance_hal.shared_instance().raw_instance();
+        let raw_device = device_hal.raw_device();
+
+        let mut external_memory_image_info =
+            vk::ExternalMemoryImageCreateInfo::default().handle_types(handle_type);
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(map_texture_format(format)?)
+            .extent(vk::Extent3D {
+                width: size.width,
+                height: size.height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut external_memory_image_info);
+
+        let image = unsafe { raw_device.create_image(&image_info, None) }
+            .map_err(|error| map_vk_error("vkCreateImage", error))?;
+        let requirements = unsafe { raw_device.get_image_memory_requirements(image) };
+        let memory_type_index = match find_device_local_memory_type(
+            raw_instance,
+            device_hal.raw_physical_device(),
+            requirements.memory_type_bits,
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                unsafe {
+                    raw_device.destroy_image(image, None);
+                }
+                return Err(error);
+            }
+        };
+
+        let mut dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+        let mut export_memory_info =
+            vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
+        let mut export_memory_win32_info =
+            vk::ExportMemoryWin32HandleInfoKHR::default().dw_access(WIN32_SHARED_HANDLE_ACCESS);
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut dedicated_allocate_info)
+            .push_next(&mut export_memory_info)
+            .push_next(&mut export_memory_win32_info);
+
+        let memory = match unsafe { raw_device.allocate_memory(&allocate_info, None) } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe {
+                    raw_device.destroy_image(image, None);
+                }
+                return Err(map_vk_error("vkAllocateMemory", error));
+            }
+        };
+
+        if let Err(error) = unsafe { raw_device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                raw_device.free_memory(memory, None);
+                raw_device.destroy_image(image, None);
+            }
+            return Err(map_vk_error("vkBindImageMemory", error));
+        }
+
+        let sync_semaphore =
+            create_exportable_timeline_semaphore(raw_instance, raw_device, sync_mode)?;
+        let exported_memory_handle = match export_memory_handle(instance, device, memory)? {
+            VulkanExternalMemoryHandle::OpaqueWin32Handle(handle) => handle,
+        };
+        let exported_sync_handle = match sync_semaphore {
+            Some(semaphore) => Some(match export_sync_handle(instance, device, semaphore)? {
+                VulkanExternalSyncHandle::OpaqueWin32Handle(handle) => handle,
+            }),
+            None => None,
+        };
+
+        let drop_device = raw_device.clone();
+        let drop_sync_semaphore = sync_semaphore;
+        let drop_callback: wgpu::hal::DropCallback = Box::new(move || unsafe {
+            if let Some(semaphore) = drop_sync_semaphore {
+                drop_device.destroy_semaphore(semaphore, None);
+            }
+            drop_device.destroy_image(image, None);
+            drop_device.free_memory(memory, None);
+        });
+        let hal_texture =
+            unsafe { device_hal.texture_from_raw(image, &hal_desc, Some(drop_callback)) };
+
+        (
+            image,
+            memory,
+            sync_semaphore,
+            requirements.size,
+            exported_memory_handle,
+            exported_sync_handle,
+            hal_texture,
+        )
+    };
+
     let texture = unsafe {
         device.create_texture_from_hal::<wgpu::hal::api::Vulkan>(hal_texture, &wgpu_desc)
     };
 
-    Ok(CachedExportTexture {
+    #[cfg(target_os = "linux")]
+    return Ok(CachedExportTexture {
         resource_id: NEXT_RESOURCE_ID.fetch_add(1, Ordering::Relaxed),
         image,
         device_memory: memory,
@@ -560,7 +749,23 @@ fn create_cached_export_texture(
         height: size.height,
         format,
         texture,
-    })
+    });
+
+    #[cfg(target_os = "windows")]
+    return Ok(CachedExportTexture {
+        resource_id: NEXT_RESOURCE_ID.fetch_add(1, Ordering::Relaxed),
+        image,
+        device_memory: memory,
+        sync_semaphore,
+        next_sync_value: AtomicU64::new(0),
+        allocation_size,
+        width: size.width,
+        height: size.height,
+        format,
+        exported_memory_handle,
+        exported_sync_handle,
+        texture,
+    });
 }
 
 fn hal_texture_descriptor(texture: &wgpu::Texture) -> wgpu::hal::TextureDescriptor<'static> {
@@ -697,7 +902,8 @@ fn create_exportable_timeline_semaphore(
         .push_next(&mut timeline_info)
         .push_next(&mut export_info);
     #[cfg(target_os = "windows")]
-    let mut export_win32_info = vk::ExportSemaphoreWin32HandleInfoKHR::default();
+    let mut export_win32_info =
+        vk::ExportSemaphoreWin32HandleInfoKHR::default().dw_access(WIN32_SHARED_HANDLE_ACCESS);
     #[cfg(target_os = "windows")]
     let create_info = vk::SemaphoreCreateInfo::default()
         .push_next(&mut timeline_info)

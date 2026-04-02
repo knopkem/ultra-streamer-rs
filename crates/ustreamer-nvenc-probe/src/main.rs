@@ -15,7 +15,7 @@ mod windows_probe {
     use anyhow::{Context, Result, anyhow, bail};
     use std::env;
     use ustreamer_capture::{
-        CapturedFrame, FrameCapture, VulkanCaptureSyncMode, VulkanExternalCapture,
+        CaptureError, CapturedFrame, FrameCapture, VulkanCaptureSyncMode, VulkanExternalCapture,
         VulkanExternalSync,
     };
     use ustreamer_encode::{
@@ -62,6 +62,11 @@ mod windows_probe {
         Help,
     }
 
+    enum ProbeRunStatus {
+        Passed,
+        Skipped(String),
+    }
+
     pub fn run() -> Result<()> {
         let command = parse_args()?;
         match command {
@@ -99,18 +104,35 @@ mod windows_probe {
         })?;
 
         let mut failures = Vec::new();
+        let mut skipped = Vec::new();
         for &sync_mode in selected_sync_modes(options.sync_mode) {
-            if let Err(error) = run_single_probe(&context, &mut encoder, &options, sync_mode) {
-                eprintln!("[fail] {}: {error:#}", capture_sync_mode_name(sync_mode));
-                failures.push((sync_mode, error));
+            match run_single_probe(&context, &mut encoder, &options, sync_mode) {
+                Ok(ProbeRunStatus::Passed) => {}
+                Ok(ProbeRunStatus::Skipped(reason)) => {
+                    println!("[skip] {}: {reason}", capture_sync_mode_name(sync_mode));
+                    skipped.push((sync_mode, reason));
+                }
+                Err(error) => {
+                    eprintln!("[fail] {}: {error:#}", capture_sync_mode_name(sync_mode));
+                    failures.push((sync_mode, error));
+                }
             }
         }
 
         if failures.is_empty() {
-            println!(
-                "[summary] all selected probe modes passed on adapter {}",
-                context.adapter_name
-            );
+            if skipped.is_empty() {
+                println!(
+                    "[summary] all selected probe modes passed on adapter {}",
+                    context.adapter_name
+                );
+            } else {
+                println!(
+                    "[summary] probe completed on adapter {} with {} pass(es) and {} skipped mode(s)",
+                    context.adapter_name,
+                    selected_sync_modes(options.sync_mode).len() - skipped.len(),
+                    skipped.len()
+                );
+            }
             return Ok(());
         }
 
@@ -185,23 +207,32 @@ mod windows_probe {
         encoder: &mut NvencEncoder,
         options: &ProbeOptions,
         sync_mode: VulkanCaptureSyncMode,
-    ) -> Result<()> {
+    ) -> Result<ProbeRunStatus> {
         println!("[probe] {}", capture_sync_mode_name(sync_mode));
 
         let mut capture = VulkanExternalCapture::with_sync_mode(sync_mode);
-        let frame = capture
-            .capture(
-                &context.instance,
-                &context.device,
-                &context.queue,
-                &context.texture,
-            )
-            .with_context(|| {
-                format!(
-                    "capture failed in {} mode",
-                    capture_sync_mode_name(sync_mode)
-                )
-            })?;
+        let frame = match capture.capture(
+            &context.instance,
+            &context.device,
+            &context.queue,
+            &context.texture,
+        ) {
+            Ok(frame) => frame,
+            Err(CaptureError::ExternalMemoryUnavailable(message))
+                if sync_mode == VulkanCaptureSyncMode::ExportedTimelineSemaphore
+                    && message.contains("external-semaphore export extension") =>
+            {
+                return Ok(ProbeRunStatus::Skipped(message));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "capture failed in {} mode",
+                        capture_sync_mode_name(sync_mode)
+                    )
+                });
+            }
+        };
 
         let captured_sync_value = verify_capture_sync(&frame, sync_mode)?;
         let params = probe_encode_params(options.width, options.height);
@@ -254,7 +285,7 @@ mod windows_probe {
         }
 
         println!("[pass] {} complete", capture_sync_mode_name(sync_mode));
-        Ok(())
+        Ok(ProbeRunStatus::Passed)
     }
 
     fn verify_capture_sync(
