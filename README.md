@@ -6,6 +6,10 @@ Turn your native wgpu render loop into a remotely-accessible, interactive web ap
 
 The first fast path is now implemented on macOS: `wgpu` Metal texture → IOSurface-backed `CVPixelBuffer` → VideoToolbox HEVC, with extracted `hvcC` decoder configuration for browser-side WebCodecs setup.
 
+The first Linux/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, and exports an `OPAQUE_FD` handle for future CUDA/NVENC import.
+
+The first encode-side NVENC groundwork is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames and translates them into explicit external-memory/resource-rate-control descriptors that the future CUDA/NVENC FFI layer will consume. Actual CUDA import, external synchronization, and NVENC session/bitstream output are still pending.
+
 ## Use Cases
 
 - **3D visualization** — CAD viewers, scientific visualization, game engines
@@ -41,6 +45,8 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Zero-copy frame capture** from wgpu render targets (Metal IOSurface, Vulkan/CUDA interop)
 - **Hardware video encoding** at up to 4K@60fps with < 3ms encode latency
 - **macOS VideoToolbox HEVC backend** with native length-prefixed access units and `hvcC` decoder-config extraction
+- **Feature-gated Linux Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, and exports `OPAQUE_FD` handles for future CUDA/NVENC import
+- **Feature-gated NVENC descriptor-prep backend** — validates exported Vulkan frames and builds direct-NVENC import/rate-control descriptors for the next CUDA/NVENC FFI slice
 - **WebTransport + WebCodecs** for lowest possible browser delivery latency
 - **WebSocket fallback transport** for browsers or environments without WebTransport
 - **Settle refinement groundwork** — quality-controller mode switching and forced keyframes on idle refine
@@ -50,6 +56,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Typed control protocol** — shared decoder-config / status / session-metrics / frame-checksum JSON messages
 - **Browser metrics HUD** — decode timing, frame drops, connection mode, server-fed RTT/encode telemetry, and checksum verification status
 - **Headless live-test demo** — offscreen `wgpu` renderer streamed to the bundled browser client on macOS
+- **Multi-client demo broadcast** — multiple browser viewers can attach to the same headless demo stream simultaneously
 
 ## Quick Live Test
 
@@ -70,8 +77,11 @@ The demo currently exercises:
 - WebCodecs decode and interactive input round-trip
 - settle/refine frame signaling in the browser HUD
 - diagnostic frame-checksum verification in the browser HUD
+- multiple simultaneous WebSocket viewers receiving the same live stream
 
 On macOS, VideoToolbox HEVC refine frames are currently **high-bitrate visually-lossless settle frames**, not bit-exact lossless frames. The protocol now distinguishes generic `refine` frames from true `lossless-refine` frames so future NVENC/software backends can advertise real lossless output honestly. The new checksum path makes that visible in the browser HUD today: true lossless backends should verify cleanly, while the current VideoToolbox refine path is expected to report mismatches.
+
+The current multi-client demo path uses a **shared encoded stream** broadcast to all connected viewers. That is enough for LAN demos and smoke tests; truly independent per-client encoder instances remain a future scaling step if different bitrate ladders or codec negotiation per viewer become necessary.
 
 Demo controls:
 

@@ -8,6 +8,11 @@
 #[cfg(target_os = "macos")]
 pub mod metal;
 pub mod staging;
+#[cfg(all(
+    feature = "vulkan-external",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod vulkan_external;
 
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::CFRetained;
@@ -15,6 +20,11 @@ use objc2_core_foundation::CFRetained;
 use objc2_core_video::CVPixelBuffer;
 #[cfg(target_os = "macos")]
 use objc2_io_surface::IOSurfaceRef;
+#[cfg(all(
+    feature = "vulkan-external",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub use vulkan_external::{VulkanExternalCapture, VulkanExternalImage, VulkanExternalMemoryHandle};
 
 /// Diagnostic checksum over canonical RGBA8 pixel bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +66,12 @@ pub enum CapturedFrame {
         /// CoreVideo / IOSurface pixel format fourcc.
         pixel_format: u32,
     },
+    /// Vulkan image + external memory handles for future CUDA/NVENC import.
+    #[cfg(all(
+        feature = "vulkan-external",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    VulkanExternalImage(vulkan_external::VulkanExternalImage),
     // CudaMappedResource { ptr: ... },
 }
 
@@ -72,6 +88,11 @@ impl CapturedFrame {
             } => checksum_cpu_buffer(data, *width, *height, *stride, *format).map(Some),
             #[cfg(target_os = "macos")]
             Self::MetalPixelBuffer { .. } => Ok(None),
+            #[cfg(all(
+                feature = "vulkan-external",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            Self::VulkanExternalImage(..) => Ok(None),
         }
     }
 }
@@ -81,6 +102,7 @@ pub trait FrameCapture: Send + Sync {
     /// Capture the current render target contents.
     fn capture(
         &mut self,
+        instance: &wgpu::Instance,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,
@@ -103,6 +125,12 @@ pub enum CaptureError {
     InvalidSurface(String),
     #[error("invalid CPU buffer metadata: {0}")]
     InvalidCpuBuffer(String),
+    #[error("invalid source texture for capture: {0}")]
+    InvalidTexture(String),
+    #[error("Vulkan texture is not backed by exportable external memory: {0}")]
+    ExternalMemoryUnavailable(String),
+    #[error("Vulkan interop failed: {0}")]
+    VulkanInteropFailed(String),
 }
 
 fn checksum_cpu_buffer(
@@ -113,12 +141,10 @@ fn checksum_cpu_buffer(
     format: wgpu::TextureFormat,
 ) -> Result<FrameChecksum, CaptureError> {
     let row_bytes = match format {
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
-            width
-                .checked_mul(4)
-                .ok_or_else(|| CaptureError::InvalidCpuBuffer("row byte size overflow".into()))?
-                as usize
-        }
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => width
+            .checked_mul(4)
+            .ok_or_else(|| CaptureError::InvalidCpuBuffer("row byte size overflow".into()))?
+            as usize,
         other => return Err(CaptureError::UnsupportedFormat(other)),
     };
 

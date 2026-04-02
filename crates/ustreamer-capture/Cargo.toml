@@ -4,13 +4,19 @@ description = "GPU frame capture from wgpu render targets — zero-copy (Metal/N
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+vulkan-external = ["dep:ash"]
+vulkan-external-test-utils = ["vulkan-external"]
+
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy", "vulkan-external", "vulkan-external-test-utils"))'] }
 
 [dependencies]
 wgpu = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+ash = { version = "0.38.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.32.0"

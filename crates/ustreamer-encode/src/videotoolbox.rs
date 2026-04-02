@@ -272,8 +272,8 @@ impl VideoToolboxEncoder {
         format: wgpu::TextureFormat,
         params: &EncodeParams,
     ) -> Result<EncodedFrame, EncodeError> {
-        let pixel_format = cv_pixel_format_for_texture(format)
-            .ok_or(EncodeError::UnsupportedConfig(format!(
+        let pixel_format =
+            cv_pixel_format_for_texture(format).ok_or(EncodeError::UnsupportedConfig(format!(
                 "unsupported CPU buffer texture format {format:?}"
             )))?;
 
@@ -306,7 +306,8 @@ impl VideoToolboxEncoder {
             )));
         }
 
-        let copy_result = copy_cpu_frame_into_pixel_buffer(&pixel_buffer, data, width, height, stride, format);
+        let copy_result =
+            copy_cpu_frame_into_pixel_buffer(&pixel_buffer, data, width, height, stride, format);
         let unlock_status = unsafe { CVPixelBufferUnlockBaseAddress(&pixel_buffer, lock_flags) };
         if unlock_status != kCVReturnSuccess {
             return Err(EncodeError::EncodeFailed(format!(
@@ -577,9 +578,7 @@ fn copy_cpu_frame_into_pixel_buffer(
         let source_offset = row * source_stride;
         let destination_offset = row * destination_stride;
         let source = &data[source_offset..source_offset + row_bytes];
-        let destination = unsafe {
-            (base_address.as_ptr() as *mut u8).add(destination_offset)
-        };
+        let destination = unsafe { (base_address.as_ptr() as *mut u8).add(destination_offset) };
         unsafe {
             ptr::copy_nonoverlapping(source.as_ptr(), destination, row_bytes);
         }

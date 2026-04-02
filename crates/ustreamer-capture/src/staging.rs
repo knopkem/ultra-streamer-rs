@@ -26,6 +26,7 @@ impl StagingCapture {
 impl FrameCapture for StagingCapture {
     fn capture(
         &mut self,
+        _instance: &wgpu::Instance,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         texture: &wgpu::Texture,

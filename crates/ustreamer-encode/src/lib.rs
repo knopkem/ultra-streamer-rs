@@ -5,6 +5,11 @@
 //! - **NVENC** (NVIDIA): H.265/AV1 via NVIDIA Video Codec SDK
 //! - **GStreamer** (fallback): cross-platform via GStreamer pipeline
 
+#[cfg(all(
+    feature = "nvenc-direct",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod nvenc;
 #[cfg(target_os = "macos")]
 pub mod videotoolbox;
 
@@ -88,6 +93,8 @@ pub enum EncodeError {
     EncodeFailed(String),
     #[error("unsupported configuration: {0}")]
     UnsupportedConfig(String),
+    #[error("unsupported frame input: {0}")]
+    UnsupportedFrame(String),
 }
 
 #[cfg(test)]

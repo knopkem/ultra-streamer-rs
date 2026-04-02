@@ -20,6 +20,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 mod macos_demo {
     use std::borrow::Cow;
+    use std::collections::HashSet;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::num::NonZeroU64;
@@ -38,7 +39,7 @@ mod macos_demo {
     use ustreamer_proto::control::{
         ControlMessage, FrameChecksumMessage, SessionMetricsMessage, StatusMessage,
     };
-    use ustreamer_proto::frame::packetize_frame;
+    use ustreamer_proto::frame::{FramePacket, packetize_frame};
     use ustreamer_proto::input::InputEvent;
     use ustreamer_proto::quality::QualityTier;
     use ustreamer_quality::{QualityConfig, QualityController};
@@ -53,6 +54,8 @@ mod macos_demo {
         "/../../client/index.html"
     ));
 
+    type SessionRegistry = Arc<Mutex<Vec<SessionSlot>>>;
+
     pub fn run() -> Result<()> {
         let stream_addr = SocketAddr::from(([127, 0, 0, 1], STREAM_PORT));
         let http_addr = SocketAddr::from(([127, 0, 0, 1], HTTP_PORT));
@@ -60,16 +63,16 @@ mod macos_demo {
         let _http_thread = spawn_http_server(http_addr)?;
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
 
-        let current_session = Arc::new(Mutex::new(None::<SessionSlot>));
+        let sessions = Arc::new(Mutex::new(Vec::<SessionSlot>::new()));
         let session_counter = Arc::new(AtomicU64::new(1));
         let (input_tx, input_rx) = mpsc::channel();
 
         {
-            let current_session = Arc::clone(&current_session);
+            let sessions = Arc::clone(&sessions);
             let session_counter = Arc::clone(&session_counter);
             runtime.spawn(async move {
                 if let Err(error) =
-                    accept_websocket_sessions(stream_addr, current_session, session_counter, input_tx)
+                    accept_websocket_sessions(stream_addr, sessions, session_counter, input_tx)
                         .await
                 {
                     error!("websocket accept loop exited: {error:#}");
@@ -81,31 +84,52 @@ mod macos_demo {
         quality.set_tier(QualityTier::Low);
         let initial_params = quality.frame_params();
         let mut renderer = runtime
-            .block_on(HeadlessRenderer::new(initial_params.width, initial_params.height))
+            .block_on(HeadlessRenderer::new(
+                initial_params.width,
+                initial_params.height,
+            ))
             .context("failed to create headless renderer")?;
         let mut capture = StagingCapture::new(3);
         let mut encoder = VideoToolboxEncoder::new();
         let mut scene = DemoScene::default();
         let mut frame_id = 0u32;
-        let mut configured_generation = None::<u64>;
+        let mut configured_generations = HashSet::new();
+        let mut last_announced_dimensions = None::<(u32, u32)>;
+        let mut last_decoder_message = None::<Vec<u8>>;
         let mut last_metrics_sent = Instant::now();
         let start_time = Instant::now();
 
         info!("Headless demo ready.");
         info!("Open http://127.0.0.1:{HTTP_PORT}/ in Chrome/Chromium.");
         info!("WebSocket stream endpoint: ws://127.0.0.1:{STREAM_PORT}/stream");
-        info!("Controls: drag to interact, wheel to shift hue, keys 1-4 switch drag mode, R resets.");
+        info!(
+            "Controls: drag to interact, wheel to shift hue, keys 1-4 switch drag mode, R resets."
+        );
 
         loop {
             let frame_started_at = Instant::now();
             let pending_status = drain_input_events(&input_rx, &mut quality, &mut scene);
-            let Some(session) = snapshot_session(&current_session) else {
-                configured_generation = None;
+            let mut active_sessions = snapshot_sessions(&sessions);
+            if active_sessions.is_empty() {
+                configured_generations.clear();
                 thread::sleep(IDLE_POLL_INTERVAL);
                 continue;
-            };
+            }
 
-            let params = quality.frame_params();
+            configured_generations.retain(|generation| {
+                active_sessions
+                    .iter()
+                    .any(|session| session.generation == *generation)
+            });
+
+            let mut params = quality.frame_params();
+            let target_dimensions = (params.width, params.height);
+            let has_unconfigured_sessions = active_sessions
+                .iter()
+                .any(|session| !configured_generations.contains(&session.generation));
+            if has_unconfigured_sessions || last_announced_dimensions != Some(target_dimensions) {
+                params.force_keyframe = true;
+            }
             renderer
                 .ensure_size(params.width, params.height)
                 .context("failed to resize headless renderer")?;
@@ -114,7 +138,12 @@ mod macos_demo {
                 .context("failed to render demo frame")?;
 
             let captured_frame = capture
-                .capture(renderer.device(), renderer.queue(), renderer.texture())
+                .capture(
+                    renderer.instance(),
+                    renderer.device(),
+                    renderer.queue(),
+                    renderer.texture(),
+                )
                 .context("failed to capture rendered frame")?;
             let frame_checksum = captured_frame
                 .diagnostic_checksum()
@@ -123,49 +152,67 @@ mod macos_demo {
                 .encode(&captured_frame, &params)
                 .context("failed to encode captured frame")?;
 
-            if configured_generation != Some(session.generation) {
-                let decoder_config = encoder
-                    .decoder_config()
-                    .ok_or_else(|| anyhow!("encoder did not expose decoder config yet"))?;
-                let help_message = ControlMessage::Status(StatusMessage::new(scene.help_text()))
-                    .to_bytes()
-                    .context("failed to serialize demo help message")?;
-                let decoder_message = decoder_config.to_control_message_bytes();
-                let session_clone = session.session.clone();
-                let send_result: Result<()> = runtime.block_on(async {
-                    session_clone
-                        .send_control_message(&decoder_message)
-                        .await
-                        .context("failed to send decoder config")?;
-                    session_clone
-                        .send_control_message(&help_message)
-                        .await
-                        .context("failed to send demo help message")?;
-                    Ok(())
-                });
-                if let Err(error) = send_result {
-                    warn!("failed to initialize browser session: {error:#}");
-                    clear_session_if_current(&current_session, session.generation);
-                    configured_generation = None;
-                    continue;
-                }
-                configured_generation = Some(session.generation);
+            if params.force_keyframe && !encoded_frame.is_keyframe {
+                warn!("encoder ignored forced keyframe request for the current frame");
+            }
+
+            let decoder_config = encoder
+                .decoder_config()
+                .ok_or_else(|| anyhow!("encoder did not expose decoder config yet"))?;
+            let decoder_message = decoder_config.to_control_message_bytes();
+            if last_decoder_message.as_ref() != Some(&decoder_message) {
+                configured_generations.clear();
+                last_decoder_message = Some(decoder_message.clone());
+            }
+            last_announced_dimensions =
+                Some((decoder_config.coded_width, decoder_config.coded_height));
+
+            let help_message = ControlMessage::Status(StatusMessage::new(scene.help_text()))
+                .to_bytes()
+                .context("failed to serialize demo help message")?;
+            let init_failures = initialize_unconfigured_sessions(
+                &runtime,
+                &active_sessions,
+                &mut configured_generations,
+                &decoder_message,
+                &help_message,
+            );
+            if !init_failures.is_empty() {
+                remove_sessions(&sessions, &init_failures);
+                configured_generations.retain(|generation| !init_failures.contains(generation));
+                active_sessions.retain(|session| !init_failures.contains(&session.generation));
+            }
+
+            if active_sessions.is_empty() {
+                continue;
+            }
+
+            let mut broadcast_sessions: Vec<SessionSlot> = active_sessions
+                .iter()
+                .filter(|session| configured_generations.contains(&session.generation))
+                .cloned()
+                .collect();
+            if broadcast_sessions.is_empty() {
+                continue;
             }
 
             if let Some(status) = pending_status {
                 let status_message = ControlMessage::Status(StatusMessage::new(status))
                     .to_bytes()
                     .context("failed to serialize status message")?;
-                let session_clone = session.session.clone();
-                if let Err(error) = runtime.block_on(async {
-                    session_clone
-                        .send_control_message(&status_message)
-                        .await
-                        .context("failed to send status message")
-                }) {
-                    warn!("failed to push status message: {error:#}");
-                    clear_session_if_current(&current_session, session.generation);
-                    configured_generation = None;
+                let status_failures = send_control_messages_to_sessions(
+                    &runtime,
+                    &broadcast_sessions,
+                    &[status_message],
+                );
+                if !status_failures.is_empty() {
+                    remove_sessions(&sessions, &status_failures);
+                    configured_generations
+                        .retain(|generation| !status_failures.contains(generation));
+                    broadcast_sessions
+                        .retain(|session| !status_failures.contains(&session.generation));
+                }
+                if broadcast_sessions.is_empty() {
                     continue;
                 }
             }
@@ -212,35 +259,19 @@ mod macos_demo {
                 last_metrics_sent = Instant::now();
             }
 
-            let session_clone = session.session.clone();
-            let send_result: Result<()> = runtime.block_on(async {
-                for message in &pre_frame_control_messages {
-                    session_clone
-                        .send_control_message(message)
-                        .await
-                        .context("failed to send pre-frame control message")?;
-                }
-                session_clone
-                    .send_frame_packets(&packets)
-                    .await
-                    .context("failed to send frame packets")?;
-                for message in &post_frame_control_messages {
-                    session_clone
-                        .send_control_message(message)
-                        .await
-                        .context("failed to send control message")?;
-                }
-                Ok(())
-            });
-            if let Err(error) = send_result {
-                warn!("stream send failed: {error:#}");
-                clear_session_if_current(&current_session, session.generation);
-                configured_generation = None;
-                continue;
+            let send_failures = send_frame_batches_to_sessions(
+                &runtime,
+                &broadcast_sessions,
+                &pre_frame_control_messages,
+                &packets,
+                &post_frame_control_messages,
+            );
+            if !send_failures.is_empty() {
+                remove_sessions(&sessions, &send_failures);
+                configured_generations.retain(|generation| !send_failures.contains(generation));
             }
 
-            let target_frame_time =
-                Duration::from_secs_f64(1.0 / params.target_fps.max(1) as f64);
+            let target_frame_time = Duration::from_secs_f64(1.0 / params.target_fps.max(1) as f64);
             let elapsed = frame_started_at.elapsed();
             if elapsed < target_frame_time {
                 thread::sleep(target_frame_time - elapsed);
@@ -250,14 +281,17 @@ mod macos_demo {
 
     async fn accept_websocket_sessions(
         bind_address: SocketAddr,
-        current_session: Arc<Mutex<Option<SessionSlot>>>,
+        sessions: SessionRegistry,
         session_counter: Arc<AtomicU64>,
         input_tx: mpsc::Sender<InputEvent>,
     ) -> Result<()> {
         let server = WebSocketServer::bind(bind_address)
             .await
             .context("failed to bind websocket server")?;
-        info!("Listening for browser sessions on ws://{}/stream", server.local_addr()?);
+        info!(
+            "Listening for browser sessions on ws://{}/stream",
+            server.local_addr()?
+        );
 
         loop {
             let accepted = server
@@ -265,20 +299,26 @@ mod macos_demo {
                 .await
                 .context("failed to accept websocket session")?;
             if accepted.path != "/stream" {
-                warn!("accepting websocket session on unexpected path {}", accepted.path);
+                warn!(
+                    "accepting websocket session on unexpected path {}",
+                    accepted.path
+                );
             }
 
             let generation = session_counter.fetch_add(1, Ordering::Relaxed);
-            {
-                let mut slot = current_session.lock().expect("session mutex poisoned");
-                *slot = Some(SessionSlot {
+            let active_count = add_session(
+                &sessions,
+                SessionSlot {
                     generation,
                     session: accepted.session.clone(),
-                });
-            }
-            info!("browser session {generation} connected from {}", accepted.session.remote_address());
+                },
+            );
+            info!(
+                "browser session {generation} connected from {} ({active_count} active)",
+                accepted.session.remote_address()
+            );
 
-            let current_session = Arc::clone(&current_session);
+            let sessions = Arc::clone(&sessions);
             let input_tx = input_tx.clone();
             let session = accepted.session.clone();
             tokio::spawn(async move {
@@ -296,7 +336,8 @@ mod macos_demo {
                     }
                 }
 
-                clear_session_if_current(&current_session, generation);
+                let active_count = remove_session(&sessions, generation);
+                info!("browser session {generation} disconnected ({active_count} active)");
             });
         }
     }
@@ -367,18 +408,141 @@ mod macos_demo {
         last_status
     }
 
-    fn snapshot_session(current_session: &Arc<Mutex<Option<SessionSlot>>>) -> Option<SessionSlot> {
-        current_session
-            .lock()
-            .expect("session mutex poisoned")
-            .clone()
+    fn snapshot_sessions(sessions: &SessionRegistry) -> Vec<SessionSlot> {
+        sessions.lock().expect("session mutex poisoned").clone()
     }
 
-    fn clear_session_if_current(current_session: &Arc<Mutex<Option<SessionSlot>>>, generation: u64) {
-        let mut slot = current_session.lock().expect("session mutex poisoned");
-        if slot.as_ref().map(|current| current.generation) == Some(generation) {
-            *slot = None;
+    fn add_session(sessions: &SessionRegistry, session: SessionSlot) -> usize {
+        let mut slot = sessions.lock().expect("session mutex poisoned");
+        slot.push(session);
+        slot.len()
+    }
+
+    fn remove_session(sessions: &SessionRegistry, generation: u64) -> usize {
+        let mut slot = sessions.lock().expect("session mutex poisoned");
+        slot.retain(|session| session.generation != generation);
+        slot.len()
+    }
+
+    fn remove_sessions(sessions: &SessionRegistry, failed_generations: &HashSet<u64>) -> usize {
+        let mut slot = sessions.lock().expect("session mutex poisoned");
+        slot.retain(|session| !failed_generations.contains(&session.generation));
+        slot.len()
+    }
+
+    fn initialize_unconfigured_sessions(
+        runtime: &Runtime,
+        sessions: &[SessionSlot],
+        configured_generations: &mut HashSet<u64>,
+        decoder_message: &[u8],
+        help_message: &[u8],
+    ) -> HashSet<u64> {
+        let mut failed_generations = HashSet::new();
+        for session in sessions {
+            if configured_generations.contains(&session.generation) {
+                continue;
+            }
+
+            let session_clone = session.session.clone();
+            let send_result: Result<()> = runtime.block_on(async {
+                session_clone
+                    .send_control_message(decoder_message)
+                    .await
+                    .context("failed to send decoder config")?;
+                session_clone
+                    .send_control_message(help_message)
+                    .await
+                    .context("failed to send demo help message")?;
+                Ok(())
+            });
+
+            match send_result {
+                Ok(()) => {
+                    configured_generations.insert(session.generation);
+                }
+                Err(error) => {
+                    warn!(
+                        "failed to initialize browser session {}: {error:#}",
+                        session.generation
+                    );
+                    failed_generations.insert(session.generation);
+                }
+            }
         }
+
+        failed_generations
+    }
+
+    fn send_control_messages_to_sessions(
+        runtime: &Runtime,
+        sessions: &[SessionSlot],
+        messages: &[Vec<u8>],
+    ) -> HashSet<u64> {
+        let mut failed_generations = HashSet::new();
+        for session in sessions {
+            let session_clone = session.session.clone();
+            let send_result: Result<()> = runtime.block_on(async {
+                for message in messages {
+                    session_clone
+                        .send_control_message(message)
+                        .await
+                        .context("failed to send control message")?;
+                }
+                Ok(())
+            });
+
+            if let Err(error) = send_result {
+                warn!(
+                    "failed to send control messages to browser session {}: {error:#}",
+                    session.generation
+                );
+                failed_generations.insert(session.generation);
+            }
+        }
+
+        failed_generations
+    }
+
+    fn send_frame_batches_to_sessions(
+        runtime: &Runtime,
+        sessions: &[SessionSlot],
+        pre_frame_control_messages: &[Vec<u8>],
+        packets: &[FramePacket],
+        post_frame_control_messages: &[Vec<u8>],
+    ) -> HashSet<u64> {
+        let mut failed_generations = HashSet::new();
+        for session in sessions {
+            let session_clone = session.session.clone();
+            let send_result: Result<()> = runtime.block_on(async {
+                for message in pre_frame_control_messages {
+                    session_clone
+                        .send_control_message(message)
+                        .await
+                        .context("failed to send pre-frame control message")?;
+                }
+                session_clone
+                    .send_frame_packets(packets)
+                    .await
+                    .context("failed to send frame packets")?;
+                for message in post_frame_control_messages {
+                    session_clone
+                        .send_control_message(message)
+                        .await
+                        .context("failed to send post-frame control message")?;
+                }
+                Ok(())
+            });
+
+            if let Err(error) = send_result {
+                warn!(
+                    "stream send failed for browser session {}: {error:#}",
+                    session.generation
+                );
+                failed_generations.insert(session.generation);
+            }
+        }
+
+        failed_generations
     }
 
     #[derive(Clone)]
@@ -493,6 +657,7 @@ mod macos_demo {
     }
 
     struct HeadlessRenderer {
+        instance: wgpu::Instance,
         device: wgpu::Device,
         queue: wgpu::Queue,
         texture: wgpu::Texture,
@@ -542,7 +707,8 @@ mod macos_demo {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: Some(
-                                NonZeroU64::new(std::mem::size_of::<SceneUniform>() as u64).unwrap(),
+                                NonZeroU64::new(std::mem::size_of::<SceneUniform>() as u64)
+                                    .unwrap(),
                             ),
                         },
                         count: None,
@@ -594,6 +760,7 @@ mod macos_demo {
             let (texture, texture_view) = create_render_target(&device, width, height);
 
             Ok(Self {
+                instance,
                 device,
                 queue,
                 texture,
@@ -654,6 +821,10 @@ mod macos_demo {
 
         fn device(&self) -> &wgpu::Device {
             &self.device
+        }
+
+        fn instance(&self) -> &wgpu::Instance {
+            &self.instance
         }
 
         fn queue(&self) -> &wgpu::Queue {

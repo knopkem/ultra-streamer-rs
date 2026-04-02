@@ -34,6 +34,7 @@ impl FrameCapture for MetalCapture {
     #[allow(unexpected_cfgs)]
     fn capture(
         &mut self,
+        _instance: &wgpu::Instance,
         _device: &wgpu::Device,
         _queue: &wgpu::Queue,
         texture: &wgpu::Texture,

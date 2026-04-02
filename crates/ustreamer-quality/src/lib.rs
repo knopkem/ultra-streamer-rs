@@ -185,16 +185,13 @@ impl QualityController {
 
         let (width, height, fps, bitrate, max_bitrate): (u32, u32, u32, u64, u64) =
             match self.current_tier() {
-            QualityTier::Low => (1280, 720, 30, 5_000_000, 10_000_000),
-            QualityTier::Standard => (1920, 1080, 60, 15_000_000, 30_000_000),
-            QualityTier::HighRes => (3840, 2160, 30, 40_000_000, 80_000_000),
-            QualityTier::Ultra => (3840, 2160, 60, 80_000_000, 150_000_000),
-        };
+                QualityTier::Low => (1280, 720, 30, 5_000_000, 10_000_000),
+                QualityTier::Standard => (1920, 1080, 60, 15_000_000, 30_000_000),
+                QualityTier::HighRes => (3840, 2160, 30, 40_000_000, 80_000_000),
+                QualityTier::Ultra => (3840, 2160, 60, 80_000_000, 150_000_000),
+            };
         let (bitrate, max_bitrate) = match mode {
-            EncodeMode::LosslessRefine => (
-                max_bitrate,
-                max_bitrate.saturating_mul(2),
-            ),
+            EncodeMode::LosslessRefine => (max_bitrate, max_bitrate.saturating_mul(2)),
             _ => (bitrate, max_bitrate),
         };
 
@@ -229,9 +226,7 @@ impl QualityController {
             || loss > self.config.high_res_loss_limit
         {
             QualityTier::Standard
-        } else if metrics.rtt > self.config.ultra_rtt_limit
-            || loss > self.config.ultra_loss_limit
-        {
+        } else if metrics.rtt > self.config.ultra_rtt_limit || loss > self.config.ultra_loss_limit {
             QualityTier::HighRes
         } else {
             QualityTier::Ultra
@@ -274,7 +269,10 @@ mod tests {
         assert_eq!(controller.requested_tier(), QualityTier::Standard);
         assert_eq!(controller.network_cap_tier(), QualityTier::Ultra);
         assert_eq!(controller.current_tier(), QualityTier::Standard);
-        assert_eq!((params.width, params.height, params.target_fps), (1920, 1080, 60));
+        assert_eq!(
+            (params.width, params.height, params.target_fps),
+            (1920, 1080, 60)
+        );
     }
 
     #[test]
@@ -290,7 +288,10 @@ mod tests {
         assert_eq!(controller.current_tier(), QualityTier::Standard);
 
         let params = controller.frame_params();
-        assert_eq!((params.width, params.height, params.target_fps), (1920, 1080, 60));
+        assert_eq!(
+            (params.width, params.height, params.target_fps),
+            (1920, 1080, 60)
+        );
     }
 
     #[test]
@@ -332,7 +333,8 @@ mod tests {
     #[test]
     fn settle_refine_forces_one_keyframe_until_next_input() {
         let mut controller = QualityController::new(Default::default());
-        controller.last_input_time = Instant::now() - controller.config.settle_timeout - Duration::from_millis(1);
+        controller.last_input_time =
+            Instant::now() - controller.config.settle_timeout - Duration::from_millis(1);
 
         let refine = controller.frame_params();
         assert_eq!(refine.mode, EncodeMode::LosslessRefine);

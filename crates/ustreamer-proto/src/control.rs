@@ -163,11 +163,7 @@ mod optional_base64_bytes {
     {
         let encoded = Option::<String>::deserialize(deserializer)?;
         encoded
-            .map(|value| {
-                BASE64
-                    .decode(value)
-                    .map_err(serde::de::Error::custom)
-            })
+            .map(|value| BASE64.decode(value).map_err(serde::de::Error::custom))
             .transpose()
     }
 }
@@ -235,12 +231,9 @@ mod tests {
 
     #[test]
     fn parses_status_message_from_json() {
-        let decoded = ControlMessage::from_slice(br#"{"type":"status","message":"ready"}"#)
-            .unwrap();
+        let decoded =
+            ControlMessage::from_slice(br#"{"type":"status","message":"ready"}"#).unwrap();
 
-        assert_eq!(
-            decoded,
-            ControlMessage::Status(StatusMessage::new("ready"))
-        );
+        assert_eq!(decoded, ControlMessage::Status(StatusMessage::new("ready")));
     }
 }

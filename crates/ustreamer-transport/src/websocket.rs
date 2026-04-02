@@ -7,8 +7,8 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
 use ustreamer_proto::frame::FramePacket;
 use ustreamer_proto::input::InputEvent;
@@ -110,8 +110,9 @@ impl WebSocketSession {
 
     /// Send a reliable UTF-8 control message to the browser.
     pub async fn send_control_message(&self, payload: &[u8]) -> Result<(), TransportError> {
-        let text = String::from_utf8(payload.to_vec())
-            .map_err(|err| TransportError::StreamIo(format!("control payload was not utf-8: {err}")))?;
+        let text = String::from_utf8(payload.to_vec()).map_err(|err| {
+            TransportError::StreamIo(format!("control payload was not utf-8: {err}"))
+        })?;
         self.send_message(Message::Text(text.into())).await
     }
 
@@ -150,7 +151,7 @@ impl WebSocketSession {
                 Some(Ok(Message::Text(_))) => {
                     return Err(TransportError::InvalidInputEvent(
                         "expected binary input event over WebSocket".into(),
-                    ))
+                    ));
                 }
                 Some(Ok(Message::Close(_))) | None => return Err(TransportError::SessionClosed),
                 Some(Ok(Message::Ping(_)))
@@ -208,8 +209,11 @@ mod tests {
             .send(Message::Binary(event.to_bytes().into()))
             .await?;
 
-        let received = timeout(Duration::from_secs(2), pair.server_session.recv_reliable_input())
-            .await??;
+        let received = timeout(
+            Duration::from_secs(2),
+            pair.server_session.recv_reliable_input(),
+        )
+        .await??;
         match received {
             InputEvent::KeyDown { code } => assert_eq!(code, 0x0041),
             other => panic!("unexpected input event: {other:?}"),

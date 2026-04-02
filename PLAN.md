@@ -27,7 +27,10 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** typed control-message protocol plus browser metrics dashboard hooks for decode time, frame drops, encode time, and RTT
 - **Implemented:** diagnostic frame checksums over staged CPU frames with browser-side verification HUD plumbing for refine/lossless updates
 - **Implemented:** headless live-test server (`cargo run -p ustreamer-demo`) serving the browser client and streaming an offscreen `wgpu` scene over WebSocket
-- **Next up:** the NVIDIA zero-copy/NVENC path and backend-specific true-lossless refine where supported
+- **Implemented:** feature-gated Linux Vulkan external-memory export path that allocates exportable images, wraps them back into `wgpu`, performs a normal `copy_texture_to_texture`, and exports `OPAQUE_FD` handles for future CUDA/NVENC import
+- **Implemented:** feature-gated direct-NVENC encode groundwork that validates exported Vulkan frames and translates them into explicit external-memory/rate-control descriptors for the future CUDA/NVENC FFI layer
+- **Implemented:** multi-client demo broadcast over WebSocket with per-viewer initialization and forced keyframes for newly joined viewers
+- **Next up:** CUDA external-memory import + external synchronization + NVENC session/bitstream output on Linux, Windows external-handle parity, and backend-specific true-lossless refine where supported
 
 ---
 
@@ -694,8 +697,8 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **input-bridge-rust** *(done)*: Rust-side binary input decode → map to abstract AppAction events for the consumer application
 
 ### Phase 2: NVIDIA + Quality + Lossless
-- **capture-nvenc-zerocopy**: wgpu-hal Vulkan texture → VkImage export → CUDA external memory import → NVENC register resource
-- **encoder-nvenc-direct**: Direct NVENC encoder via nvidia-video-codec-rs — H.265/AV1, ultra-low-latency tuning
+- **capture-nvenc-zerocopy**: feature-gated `VulkanExternalCapture` now allocates exportable Vulkan images, re-wraps them as `wgpu::Texture`s, copies render targets into them with standard `wgpu` commands, and exports Linux `OPAQUE_FD` handles; remaining work is CUDA external-memory import, external synchronization/ownership handoff, and the Windows handle-export path
+- **encoder-nvenc-direct**: feature-gated `NvencEncoder` module is now in place and can translate exported Vulkan frames into explicit direct-NVENC input/rate-control descriptors; remaining work is the actual CUDA import + NVENC FFI/session wiring and bitstream output
 - **lossless-settle** *(done)*: Idle detection → forced high-bitrate refine keyframe, explicit `refine` vs `lossless` signaling on the wire; VideoToolbox remains visually-lossless only, while future backends can mark true lossless frames
 - **lossless-checksum** *(done)*: Server computes diagnostic RGBA checksums for CPU-readable frames, sends them as typed control messages, and the browser verifies decoded output in the HUD; this already proves current VideoToolbox refine frames are not bit-exact, while future true-lossless backends can validate cleanly
 - **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle
@@ -706,7 +709,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **capture-staging-fallback** *(done)*: Triple-buffered copy_texture_to_buffer for platforms without zero-copy interop
 - **transport-ws-fallback** *(done)*: WebSocket fallback transport for non-Chrome browsers (same WebCodecs decode)
 - **headless-server** *(done)*: Run viewer without window for dedicated server deployment (wgpu headless device)
-- **multi-client**: Multiple simultaneous browser sessions from one server (independent encode sessions)
+- **multi-client** *(done)*: Multiple simultaneous browser sessions from one server are now supported in the demo via a shared encoded stream broadcast with per-viewer decoder initialization; fully independent per-client encoder instances remain a future scaling refinement
 - **av1-support**: Enable AV1 encoding on RTX 40+/M4 Pro+ with codec negotiation at session start
 
 ### Phase 4: Advanced Optimization

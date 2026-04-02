@@ -4,12 +4,19 @@ description = "Hardware video encoding — VideoToolbox (macOS), NVENC (NVIDIA),
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+nvenc-direct = ["ustreamer-capture/vulkan-external"]
+
 [dependencies]
 ustreamer-capture = { workspace = true }
 ustreamer-proto = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
+
+[dev-dependencies]
+ustreamer-capture = { workspace = true, features = ["vulkan-external", "vulkan-external-test-utils"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = "0.3.2"
