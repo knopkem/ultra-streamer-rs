@@ -106,6 +106,17 @@ mod demo {
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
         ))]
+        fn from_nvenc(codec: NvencCodec) -> Self {
+            match codec {
+                NvencCodec::Hevc => Self::Hevc,
+                NvencCodec::Av1 => Self::Av1,
+            }
+        }
+
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
         fn nvenc_codec(self) -> NvencCodec {
             match self {
                 Self::Hevc => NvencCodec::Hevc,
@@ -214,7 +225,10 @@ mod demo {
                         "failed to probe NVENC codec support on CUDA device {}: {error}",
                         options.nvenc_device
                     )
-                })?;
+                })?
+                .into_iter()
+                .map(DemoCodec::from_nvenc)
+                .collect::<Vec<_>>();
                 let codec = resolve_demo_codec(options.codec_override, &supported_codecs).map_err(
                     |error| {
                         anyhow!(
@@ -242,7 +256,10 @@ mod demo {
                     codec,
                 });
             }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "windows"),
+                not(feature = "nvenc-direct")
+            ))]
             {
                 anyhow::bail!(
                     "ustreamer-demo on {} requires the `nvenc-direct` feature; run `cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device {} --codec {}`",
