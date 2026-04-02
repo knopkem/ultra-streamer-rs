@@ -1,0 +1,11 @@
+[package]
+name = "ustreamer-app"
+description = "Integration traits and helpers for wiring wgpu apps into ultra-streamer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+wgpu = { workspace = true }
+ustreamer-input = { workspace = true }
+ustreamer-proto = { workspace = true }
+ustreamer-quality = { workspace = true }

@@ -15,6 +15,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 wgpu = { workspace = true }
+ustreamer-app = { workspace = true }
 ustreamer-capture = { workspace = true }
 ustreamer-encode = { workspace = true }
 ustreamer-input = { workspace = true }

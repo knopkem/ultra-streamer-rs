@@ -23,6 +23,7 @@ See [PLAN.md](./PLAN.md) for the full architecture document.
 
 ```
 crates/
+├── ustreamer-app        # App-facing integration traits/helpers for frame source + input wiring
 ├── ustreamer-capture    # GPU frame capture (zero-copy Metal/NVENC + staging fallback)
 ├── ustreamer-demo       # Headless live-test server (macOS VideoToolbox or Windows/Linux Vulkan+NVENC)
 ├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, GStreamer)
@@ -57,6 +58,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Compact binary input protocol** — sub-millisecond input event delivery
 - **Typed control protocol** — shared decoder-config / status / session-metrics / frame-checksum JSON messages
 - **Browser metrics HUD** — decode timing, frame drops, connection mode, server-fed RTT/encode telemetry, and checksum verification status
+- **App integration crate** — `ustreamer-app` now exposes documented traits/helpers for frame sourcing, mapped/raw input sinks, loopback bootstrap endpoints, and optional session lifecycle hooks so adopting `wgpu` apps need less bespoke glue
 - **Headless live-test demo** — offscreen `wgpu` renderer streamed to the bundled browser client on macOS, plus a feature-gated Vulkan/NVENC demo path on Windows/Linux
 - **Multi-client demo broadcast** — multiple browser viewers can attach to the same headless demo stream simultaneously
 

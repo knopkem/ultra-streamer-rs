@@ -2188,6 +2188,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ustreamer-app"
+version = "0.1.0"
+dependencies = [
+ "ustreamer-input",
+ "ustreamer-proto",
+ "ustreamer-quality",
+ "wgpu",
+]
+
+[[package]]
 name = "ustreamer-capture"
 version = "0.1.0"
 dependencies = [
@@ -2211,6 +2221,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ustreamer-app",
  "ustreamer-capture",
  "ustreamer-encode",
  "ustreamer-input",

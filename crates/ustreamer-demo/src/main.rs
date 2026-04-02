@@ -27,6 +27,10 @@ mod demo {
     use bytemuck::{Pod, Zeroable};
     use tokio::runtime::Runtime;
     use tracing::{error, info, warn};
+    use ustreamer_app::{
+        AppActionSink, LocalStreamEndpoints, MappedInputApp, StreamFrameProvider,
+        drain_mapped_input_events,
+    };
     use ustreamer_capture::FrameCapture;
     #[cfg(all(
         feature = "nvenc-direct",
@@ -53,8 +57,6 @@ mod demo {
     use ustreamer_quality::{QualityConfig, QualityController};
     use ustreamer_transport::{WebSocketServer, WebSocketSession};
 
-    const STREAM_PORT: u16 = 8080;
-    const HTTP_PORT: u16 = 8090;
     const METRICS_INTERVAL: Duration = Duration::from_millis(250);
     const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
     const CLIENT_HTML: &str = include_str!(concat!(
@@ -344,8 +346,9 @@ mod demo {
     pub fn run() -> Result<()> {
         let options = DemoOptions::parse().context("failed to parse demo options")?;
         let backend = DemoBackend::select(options)?;
-        let stream_addr = SocketAddr::from(([127, 0, 0, 1], STREAM_PORT));
-        let http_addr = SocketAddr::from(([127, 0, 0, 1], HTTP_PORT));
+        let endpoints = LocalStreamEndpoints::default();
+        let stream_addr = endpoints.stream;
+        let http_addr = endpoints.http;
 
         let _http_thread = spawn_http_server(http_addr)?;
         let runtime = Runtime::new().context("failed to create tokio runtime")?;
@@ -389,15 +392,21 @@ mod demo {
 
         info!("Headless demo ready.");
         info!("Using {}.", backend.description());
-        info!("Open http://127.0.0.1:{HTTP_PORT}/ in Chrome/Chromium.");
-        info!("WebSocket stream endpoint: ws://127.0.0.1:{STREAM_PORT}/stream");
+        info!(
+            "Open http://127.0.0.1:{}/ in Chrome/Chromium.",
+            endpoints.http.port()
+        );
+        info!(
+            "WebSocket stream endpoint: ws://127.0.0.1:{}/stream",
+            endpoints.stream.port()
+        );
         info!(
             "Controls: drag to interact, wheel to shift hue, keys 1-4 switch drag mode, R resets."
         );
 
         loop {
             let frame_started_at = Instant::now();
-            let pending_status = drain_input_events(&input_rx, &mut quality, &mut scene);
+            let pending_status = drain_mapped_input_events(&input_rx, &mut quality, &mut scene);
             let mut active_sessions = snapshot_sessions(&sessions);
             if active_sessions.is_empty() {
                 configured_generations.clear();
@@ -426,12 +435,13 @@ mod demo {
                 .render(start_time.elapsed().as_secs_f32(), &scene)
                 .context("failed to render demo frame")?;
 
+            let frame_source = renderer.stream_frame_source();
             let captured_frame = capture
                 .capture(
-                    renderer.instance(),
-                    renderer.device(),
-                    renderer.queue(),
-                    renderer.texture(),
+                    frame_source.instance,
+                    frame_source.device,
+                    frame_source.queue,
+                    frame_source.texture,
                 )
                 .context("failed to capture rendered frame")?;
             let frame_checksum = captured_frame
@@ -681,22 +691,6 @@ mod demo {
         Ok(())
     }
 
-    fn drain_input_events(
-        input_rx: &mpsc::Receiver<InputEvent>,
-        quality: &mut QualityController,
-        scene: &mut DemoScene,
-    ) -> Option<String> {
-        let mut last_status = None;
-        while let Ok(event) = input_rx.try_recv() {
-            quality.on_input();
-            if let Some(status) = scene.apply_input(event) {
-                last_status = Some(status);
-            }
-        }
-
-        last_status
-    }
-
     fn snapshot_sessions(sessions: &SessionRegistry) -> Vec<SessionSlot> {
         sessions.lock().expect("session mutex poisoned").clone()
     }
@@ -867,64 +861,6 @@ mod demo {
     }
 
     impl DemoScene {
-        fn apply_input(&mut self, event: InputEvent) -> Option<String> {
-            match event {
-                InputEvent::KeyDown { code } if code == b'1' as u16 => {
-                    self.input_mapper.set_mode(InteractionMode::Rotate);
-                    self.mode_value = 0.0;
-                    return Some("Mode 1: rotate".into());
-                }
-                InputEvent::KeyDown { code } if code == b'2' as u16 => {
-                    self.input_mapper.set_mode(InteractionMode::Pan);
-                    self.mode_value = 1.0;
-                    return Some("Mode 2: pan".into());
-                }
-                InputEvent::KeyDown { code } if code == b'3' as u16 => {
-                    self.input_mapper.set_mode(InteractionMode::Zoom);
-                    self.mode_value = 2.0;
-                    return Some("Mode 3: zoom".into());
-                }
-                InputEvent::KeyDown { code } if code == b'4' as u16 => {
-                    self.input_mapper.set_mode(InteractionMode::DragAdjust);
-                    self.mode_value = 3.0;
-                    return Some("Mode 4: drag adjust".into());
-                }
-                InputEvent::KeyDown { code } if code == b'R' as u16 => {
-                    *self = Self::default();
-                    return Some("Scene reset".into());
-                }
-                _ => {}
-            }
-
-            for action in self.input_mapper.process(&event) {
-                match action {
-                    AppAction::Rotate { dx, dy } => {
-                        self.angle += dx * 3.5;
-                        self.hue_shift = (self.hue_shift + dy * 0.25).rem_euclid(1.0);
-                    }
-                    AppAction::Zoom { delta } => {
-                        self.zoom = (self.zoom * (1.0 - delta * 1.25)).clamp(0.35, 3.5);
-                    }
-                    AppAction::Pan { dx, dy } => {
-                        self.pan[0] += dx * 1.6 / self.zoom.max(0.35);
-                        self.pan[1] -= dy * 1.6 / self.zoom.max(0.35);
-                    }
-                    AppAction::ScrollStep { delta } => {
-                        self.hue_shift = (self.hue_shift + delta as f32 * 0.06).rem_euclid(1.0);
-                    }
-                    AppAction::DragAdjust { dx, dy } => {
-                        self.hue_shift = (self.hue_shift + dx * 0.4).rem_euclid(1.0);
-                        self.exposure = (self.exposure - dy * 1.6).clamp(0.5, 1.75);
-                    }
-                    AppAction::PointerUpdate { x, y } => {
-                        self.pointer = [x, y];
-                    }
-                }
-            }
-
-            None
-        }
-
         fn help_text(&self) -> &'static str {
             "Live demo ready. Drag to interact, wheel shifts hue, keys 1-4 switch drag mode, R resets."
         }
@@ -941,6 +877,71 @@ mod demo {
                 exposure: self.exposure,
                 mode_value: self.mode_value,
                 _padding: [0.0; 4],
+            }
+        }
+    }
+
+    impl AppActionSink for DemoScene {
+        fn apply_app_action(&mut self, action: AppAction) -> Option<String> {
+            match action {
+                AppAction::Rotate { dx, dy } => {
+                    self.angle += dx * 3.5;
+                    self.hue_shift = (self.hue_shift + dy * 0.25).rem_euclid(1.0);
+                }
+                AppAction::Zoom { delta } => {
+                    self.zoom = (self.zoom * (1.0 - delta * 1.25)).clamp(0.35, 3.5);
+                }
+                AppAction::Pan { dx, dy } => {
+                    self.pan[0] += dx * 1.6 / self.zoom.max(0.35);
+                    self.pan[1] -= dy * 1.6 / self.zoom.max(0.35);
+                }
+                AppAction::ScrollStep { delta } => {
+                    self.hue_shift = (self.hue_shift + delta as f32 * 0.06).rem_euclid(1.0);
+                }
+                AppAction::DragAdjust { dx, dy } => {
+                    self.hue_shift = (self.hue_shift + dx * 0.4).rem_euclid(1.0);
+                    self.exposure = (self.exposure - dy * 1.6).clamp(0.5, 1.75);
+                }
+                AppAction::PointerUpdate { x, y } => {
+                    self.pointer = [x, y];
+                }
+            }
+            None
+        }
+    }
+
+    impl MappedInputApp for DemoScene {
+        fn input_mapper(&mut self) -> &mut InputMapper {
+            &mut self.input_mapper
+        }
+
+        fn handle_input_event(&mut self, event: &InputEvent) -> Option<String> {
+            match event {
+                InputEvent::KeyDown { code } if *code == b'1' as u16 => {
+                    self.input_mapper.set_mode(InteractionMode::Rotate);
+                    self.mode_value = 0.0;
+                    Some("Mode 1: rotate".into())
+                }
+                InputEvent::KeyDown { code } if *code == b'2' as u16 => {
+                    self.input_mapper.set_mode(InteractionMode::Pan);
+                    self.mode_value = 1.0;
+                    Some("Mode 2: pan".into())
+                }
+                InputEvent::KeyDown { code } if *code == b'3' as u16 => {
+                    self.input_mapper.set_mode(InteractionMode::Zoom);
+                    self.mode_value = 2.0;
+                    Some("Mode 3: zoom".into())
+                }
+                InputEvent::KeyDown { code } if *code == b'4' as u16 => {
+                    self.input_mapper.set_mode(InteractionMode::DragAdjust);
+                    self.mode_value = 3.0;
+                    Some("Mode 4: drag adjust".into())
+                }
+                InputEvent::KeyDown { code } if *code == b'R' as u16 => {
+                    *self = Self::default();
+                    Some("Scene reset".into())
+                }
+                _ => None,
             }
         }
     }
@@ -1130,6 +1131,17 @@ mod demo {
 
         fn texture(&self) -> &wgpu::Texture {
             &self.texture
+        }
+    }
+
+    impl StreamFrameProvider for HeadlessRenderer {
+        fn stream_frame_source(&self) -> ustreamer_app::StreamFrameSource<'_> {
+            ustreamer_app::StreamFrameSource {
+                instance: self.instance(),
+                device: self.device(),
+                queue: self.queue(),
+                texture: self.texture(),
+            }
         }
     }
 

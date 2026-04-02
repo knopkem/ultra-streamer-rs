@@ -41,7 +41,7 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** the Windows NVENC probe and Windows/Linux demo now accept an explicit codec selection (`--codec hevc|av1`) so AV1-capable NVIDIA hosts can exercise the new decoder-config path without changing code, and the demo now auto-selects the best codec for the selected/default CUDA device when no override is provided
 - **Implemented:** the direct Vulkan→CUDA interop path now maps exported Vulkan images as CUDA mipmapped arrays and registers them with NVENC as `CUDAARRAY` resources instead of treating optimal-tiled image memory as a linear `CUDADEVICEPTR`; this is the targeted fix for the distorted Windows browser output and is now ready for runtime confirmation on the RTX 2070 host
 - **Implemented:** `ustreamer-demo` now probes the local platform/GPU/encoder capabilities it can see at startup and automatically chooses the best backend/codec for the current machine — currently VideoToolbox HEVC on macOS and, for `nvenc-direct`, AV1 when the selected/default CUDA device reports support otherwise HEVC — while keeping explicit CLI overrides for validation (`--codec`, device selection, future force-backend flags)
-- **Planned:** package the reusable crates behind a simple integration surface with well-documented traits and helper types, so adopting apps only need a small amount of glue code to expose their frame texture, receive mapped input, and attach the transport/encode pipeline cleanly
+- **Implemented:** new `ustreamer-app` crate now defines the initial public integration contract for external apps — documented traits/helpers for frame sourcing, mapped/raw input sinks, loopback bootstrap endpoints, and optional session lifecycle hooks — and `ustreamer-demo` now uses those helpers instead of bespoke local glue
 - **Next up:** re-run the full browser demo path on the Windows RTX 2070 host after the CUDA-array interop fix, then replace the conservative host-side wait with a true GPU-driven handoff, validate end-to-end AV1 on AV1-capable NVIDIA hardware, and wire backend-specific true-lossless refine where supported
 
 ---
@@ -718,7 +718,7 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 
 ### Phase 3: Polish + AMD Fallback
 
-- **integration-ergonomics**: define a clear public integration contract for external apps — documented traits/helpers for frame sourcing, input sinks, lifecycle hooks, and transport/bootstrap wiring — so `wgpu` applications can adopt streaming with minimal glue code even though a fully universal one-call wrapper is unrealistic
+- **integration-ergonomics** *(done)*: `ustreamer-app` now provides the first explicit public integration contract for external apps — documented traits/helpers for frame sourcing, input sinks, lifecycle hooks, and bootstrap wiring — and the demo has been refactored to exercise that surface
 - **demo-auto-detect** *(done)*: the demo now auto-selects the best available backend/codec for the current host — currently VideoToolbox HEVC on macOS and NVENC AV1→HEVC fallback for the selected/default CUDA device on Windows/Linux — while preserving explicit CLI overrides for testing and bring-up
 - **encoder-gstreamer-fallback**: GStreamer-based encoder for AMD and unsupported GPUs (H.265 via amfenc/vaapih265enc)
 - **capture-staging-fallback** *(done)*: Triple-buffered copy_texture_to_buffer for platforms without zero-copy interop

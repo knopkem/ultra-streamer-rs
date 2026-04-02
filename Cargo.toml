@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = ["vendor/nvidia-video-codec-sdk"]
 members = [
+    "crates/ustreamer-app",
     "crates/ustreamer-capture",
     "crates/ustreamer-demo",
     "crates/ustreamer-encode",
@@ -42,6 +43,7 @@ anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 
 # Internal crates
+ustreamer-app = { path = "crates/ustreamer-app" }
 ustreamer-capture = { path = "crates/ustreamer-capture" }
 ustreamer-encode = { path = "crates/ustreamer-encode" }
 ustreamer-transport = { path = "crates/ustreamer-transport" }
