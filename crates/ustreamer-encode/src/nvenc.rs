@@ -17,7 +17,7 @@ use std::{
     fs::File,
     mem::ManuallyDrop,
     ptr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -28,20 +28,20 @@ use cudarc::driver::{
     sys,
 };
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-use nvidia_video_codec_sdk::{
-    ENCODE_API,
-    sys::nvEncodeAPI::{
-        GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG,
-        NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
-        NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
-        NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
-        NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER,
-        NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-        NV_ENC_OUTPUT_PTR, NV_ENC_PARAMS_RC_MODE, NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS,
-        NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE, NV_ENC_PRESET_CONFIG,
-        NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID, NV_ENC_REGISTER_RESOURCE,
-        NV_ENC_TUNING_INFO, NVENCAPI_VERSION, NVENCSTATUS,
-    },
+use libloading::Library;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
+    GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG,
+    NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
+    NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
+    NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
+    NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_OUTPUT_PTR, NV_ENC_PARAMS_RC_MODE,
+    NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
+    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
+    NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_TUNING_INFO,
+    NV_ENCODE_API_FUNCTION_LIST, NV_ENCODE_API_FUNCTION_LIST_VER, NVENCAPI_MAJOR_VERSION,
+    NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NVENCSTATUS,
 };
 use ustreamer_capture::{
     CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
@@ -53,6 +53,310 @@ use crate::{DecoderConfig, EncodeError, EncodedFrame, FrameEncoder};
 
 const DEFAULT_HEVC_CODEC: &str = "hvc1.1.6.L153.B0";
 const DEFAULT_AV1_CODEC: &str = "av01.0.08M.08";
+
+#[cfg(target_os = "windows")]
+const NVENC_RUNTIME_LIBRARY_CANDIDATES: &[&str] = &["nvEncodeAPI64.dll", "nvEncodeAPI.dll"];
+#[cfg(target_os = "linux")]
+const NVENC_RUNTIME_LIBRARY_CANDIDATES: &[&str] = &["libnvidia-encode.so.1", "libnvidia-encode.so"];
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const NVENC_API_MSG: &str =
+    "The NVENC runtime should populate the required function table entries.";
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type NvEncodeApiGetMaxSupportedVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+type NvEncodeApiCreateInstanceFn =
+    unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone)]
+struct NvencApi {
+    function_list: NV_ENCODE_API_FUNCTION_LIST,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe impl Send for NvencApi {}
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+unsafe impl Sync for NvencApi {}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[allow(unsafe_op_in_unsafe_fn)]
+impl NvencApi {
+    unsafe fn open_encode_session_ex(
+        &self,
+        params: *mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+        encoder: *mut *mut c_void,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncOpenEncodeSessionEx
+            .expect(NVENC_API_MSG))(params, encoder)
+    }
+
+    unsafe fn initialize_encoder(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_INITIALIZE_PARAMS,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncInitializeEncoder
+            .expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn create_bitstream_buffer(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_CREATE_BITSTREAM_BUFFER,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncCreateBitstreamBuffer
+            .expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn destroy_bitstream_buffer(
+        &self,
+        encoder: *mut c_void,
+        bitstream: NV_ENC_OUTPUT_PTR,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncDestroyBitstreamBuffer
+            .expect(NVENC_API_MSG))(encoder, bitstream)
+    }
+
+    unsafe fn encode_picture(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_PIC_PARAMS,
+    ) -> NVENCSTATUS {
+        (self.function_list.nvEncEncodePicture.expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn lock_bitstream(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_LOCK_BITSTREAM,
+    ) -> NVENCSTATUS {
+        (self.function_list.nvEncLockBitstream.expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn unlock_bitstream(
+        &self,
+        encoder: *mut c_void,
+        bitstream: NV_ENC_OUTPUT_PTR,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncUnlockBitstream
+            .expect(NVENC_API_MSG))(encoder, bitstream)
+    }
+
+    unsafe fn register_resource(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_REGISTER_RESOURCE,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncRegisterResource
+            .expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn map_input_resource(
+        &self,
+        encoder: *mut c_void,
+        params: *mut NV_ENC_MAP_INPUT_RESOURCE,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncMapInputResource
+            .expect(NVENC_API_MSG))(encoder, params)
+    }
+
+    unsafe fn unmap_input_resource(
+        &self,
+        encoder: *mut c_void,
+        mapped_resource: *mut c_void,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncUnmapInputResource
+            .expect(NVENC_API_MSG))(encoder, mapped_resource)
+    }
+
+    unsafe fn unregister_resource(
+        &self,
+        encoder: *mut c_void,
+        registered_resource: *mut c_void,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncUnregisterResource
+            .expect(NVENC_API_MSG))(encoder, registered_resource)
+    }
+
+    unsafe fn destroy_encoder(&self, encoder: *mut c_void) -> NVENCSTATUS {
+        (self.function_list.nvEncDestroyEncoder.expect(NVENC_API_MSG))(encoder)
+    }
+
+    unsafe fn get_encode_guid_count(
+        &self,
+        encoder: *mut c_void,
+        supported_count: *mut u32,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncGetEncodeGUIDCount
+            .expect(NVENC_API_MSG))(encoder, supported_count)
+    }
+
+    unsafe fn get_encode_guids(
+        &self,
+        encoder: *mut c_void,
+        guid_buffer: *mut GUID,
+        guid_array_size: u32,
+        actual_count: *mut u32,
+    ) -> NVENCSTATUS {
+        (self.function_list.nvEncGetEncodeGUIDs.expect(NVENC_API_MSG))(
+            encoder,
+            guid_buffer,
+            guid_array_size,
+            actual_count,
+        )
+    }
+
+    unsafe fn get_input_format_count(
+        &self,
+        encoder: *mut c_void,
+        codec_guid: GUID,
+        format_count: *mut u32,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncGetInputFormatCount
+            .expect(NVENC_API_MSG))(encoder, codec_guid, format_count)
+    }
+
+    unsafe fn get_input_formats(
+        &self,
+        encoder: *mut c_void,
+        codec_guid: GUID,
+        formats: *mut NV_ENC_BUFFER_FORMAT,
+        format_array_size: u32,
+        actual_count: *mut u32,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncGetInputFormats
+            .expect(NVENC_API_MSG))(
+            encoder,
+            codec_guid,
+            formats,
+            format_array_size,
+            actual_count,
+        )
+    }
+
+    unsafe fn get_encode_preset_config_ex(
+        &self,
+        encoder: *mut c_void,
+        codec_guid: GUID,
+        preset_guid: GUID,
+        tuning_info: NV_ENC_TUNING_INFO,
+        preset_config: *mut NV_ENC_PRESET_CONFIG,
+    ) -> NVENCSTATUS {
+        (self
+            .function_list
+            .nvEncGetEncodePresetConfigEx
+            .expect(NVENC_API_MSG))(
+            encoder, codec_guid, preset_guid, tuning_info, preset_config
+        )
+    }
+
+    unsafe fn get_last_error_string(&self, encoder: *mut c_void) -> *const i8 {
+        (self
+            .function_list
+            .nvEncGetLastErrorString
+            .expect(NVENC_API_MSG))(encoder)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvenc_api() -> Result<&'static NvencApi, EncodeError> {
+    static API: OnceLock<Result<NvencApi, String>> = OnceLock::new();
+    match API.get_or_init(load_nvenc_api) {
+        Ok(api) => Ok(api),
+        Err(error) => Err(EncodeError::InitFailed(error.clone())),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn load_nvenc_api() -> Result<NvencApi, String> {
+    let mut errors = Vec::new();
+    for candidate in NVENC_RUNTIME_LIBRARY_CANDIDATES {
+        match unsafe { Library::new(candidate) } {
+            Ok(library) => match unsafe { load_nvenc_api_from_library(library) } {
+                Ok(api) => return Ok(api),
+                Err(error) => errors.push(format!("{candidate}: {error}")),
+            },
+            Err(error) => errors.push(format!("{candidate}: {error}")),
+        }
+    }
+
+    Err(format!(
+        "failed to load the NVIDIA NVENC runtime library (tried {}): {}",
+        NVENC_RUNTIME_LIBRARY_CANDIDATES.join(", "),
+        errors.join("; ")
+    ))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn load_nvenc_api_from_library(library: Library) -> Result<NvencApi, String> {
+    let get_max_supported_version = *library
+        .get::<NvEncodeApiGetMaxSupportedVersionFn>(b"NvEncodeAPIGetMaxSupportedVersion\0")
+        .map_err(|error| format!("missing NvEncodeAPIGetMaxSupportedVersion export: {error}"))?;
+    let create_instance = *library
+        .get::<NvEncodeApiCreateInstanceFn>(b"NvEncodeAPICreateInstance\0")
+        .map_err(|error| format!("missing NvEncodeAPICreateInstance export: {error}"))?;
+
+    let mut max_supported_version = 0;
+    let status = get_max_supported_version(&mut max_supported_version);
+    if !nvenc_status_success(status) {
+        return Err(format!(
+            "NvEncodeAPIGetMaxSupportedVersion failed with {status:?}"
+        ));
+    }
+    assert_nvenc_versions_match(max_supported_version)?;
+
+    let mut function_list = NV_ENCODE_API_FUNCTION_LIST {
+        version: NV_ENCODE_API_FUNCTION_LIST_VER,
+        ..Default::default()
+    };
+    let status = create_instance(&mut function_list);
+    if !nvenc_status_success(status) {
+        return Err(format!("NvEncodeAPICreateInstance failed with {status:?}"));
+    }
+
+    std::mem::forget(library);
+    Ok(NvencApi { function_list })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn assert_nvenc_versions_match(max_supported_version: u32) -> Result<(), String> {
+    let major_version = max_supported_version >> 4;
+    let minor_version = max_supported_version & 0b1111;
+    if (major_version, minor_version) < (NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION) {
+        return Err(format!(
+            "NVENC runtime version {major_version}.{minor_version} is older than the header version {}.{}",
+            NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION
+        ));
+    }
+    Ok(())
+}
 
 /// Preferred direct NVENC codec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +854,7 @@ impl NvencRuntimeSession {
     }
 
     fn open_encode_session(&mut self) -> Result<(), EncodeError> {
+        let api = nvenc_api()?;
         let mut params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
             version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
             deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
@@ -558,7 +863,7 @@ impl NvencRuntimeSession {
             ..Default::default()
         };
         let mut encoder = ptr::null_mut();
-        let status = unsafe { (ENCODE_API.open_encode_session_ex)(&mut params, &mut encoder) };
+        let status = unsafe { api.open_encode_session_ex(&mut params, &mut encoder) };
         self.encoder = encoder;
         nvenc_init_result(status, self.encoder, "failed to open NVENC encode session")
     }
@@ -614,8 +919,8 @@ impl NvencRuntimeSession {
             tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
             ..Default::default()
         };
-        let status =
-            unsafe { (ENCODE_API.initialize_encoder)(self.encoder, &mut initialize_params) };
+        let api = nvenc_api()?;
+        let status = unsafe { api.initialize_encoder(self.encoder, &mut initialize_params) };
         nvenc_init_result(status, self.encoder, "failed to initialize NVENC encoder")?;
 
         let mut create_bitstream = NV_ENC_CREATE_BITSTREAM_BUFFER {
@@ -623,8 +928,7 @@ impl NvencRuntimeSession {
             bitstreamBuffer: ptr::null_mut(),
             ..Default::default()
         };
-        let status =
-            unsafe { (ENCODE_API.create_bitstream_buffer)(self.encoder, &mut create_bitstream) };
+        let status = unsafe { api.create_bitstream_buffer(self.encoder, &mut create_bitstream) };
         nvenc_init_result(
             status,
             self.encoder,
@@ -677,7 +981,8 @@ impl NvencRuntimeSession {
             encodePicFlags: encode_pic_flags,
             ..Default::default()
         };
-        let status = unsafe { (ENCODE_API.encode_picture)(self.encoder, &mut encode_pic_params) };
+        let api = nvenc_api()?;
+        let status = unsafe { api.encode_picture(self.encoder, &mut encode_pic_params) };
         nvenc_encode_result(status, self.encoder, "failed to encode NVENC picture")?;
 
         let output = self.read_output_bitstream()?;
@@ -705,7 +1010,8 @@ impl NvencRuntimeSession {
             outputBitstream: self.output_bitstream,
             ..Default::default()
         };
-        let status = unsafe { (ENCODE_API.lock_bitstream)(self.encoder, &mut lock_params) };
+        let api = nvenc_api()?;
+        let status = unsafe { api.lock_bitstream(self.encoder, &mut lock_params) };
         nvenc_encode_result(
             status,
             self.encoder,
@@ -720,8 +1026,7 @@ impl NvencRuntimeSession {
         }
         .to_vec();
         let picture_type = lock_params.pictureType;
-        let unlock_status =
-            unsafe { (ENCODE_API.unlock_bitstream)(self.encoder, self.output_bitstream) };
+        let unlock_status = unsafe { api.unlock_bitstream(self.encoder, self.output_bitstream) };
         nvenc_encode_result(
             unlock_status,
             self.encoder,
@@ -739,8 +1044,13 @@ impl NvencRuntimeSession {
                 "failed to bind CUDA context before flushing NVENC encoder: {error}"
             ))
         })?;
-        let mut eos = NV_ENC_PIC_PARAMS::end_of_stream();
-        let status = unsafe { (ENCODE_API.encode_picture)(self.encoder, &mut eos) };
+        let mut eos = NV_ENC_PIC_PARAMS {
+            version: NV_ENC_PIC_PARAMS_VER,
+            encodePicFlags: NV_ENC_PIC_FLAGS::NV_ENC_PIC_FLAG_EOS as u32,
+            ..Default::default()
+        };
+        let api = nvenc_api()?;
+        let status = unsafe { api.encode_picture(self.encoder, &mut eos) };
         nvenc_encode_result(status, self.encoder, "failed to flush NVENC encoder")?;
         Ok(Vec::new())
     }
@@ -750,14 +1060,14 @@ impl NvencRuntimeSession {
 impl Drop for NvencRuntimeSession {
     fn drop(&mut self) {
         let _ = self.ctx.bind_to_thread();
-        if !self.output_bitstream.is_null() {
-            let _ = unsafe {
-                (ENCODE_API.destroy_bitstream_buffer)(self.encoder, self.output_bitstream)
+        if let Ok(api) = nvenc_api() {
+            if !self.output_bitstream.is_null() {
+                let _ =
+                    unsafe { api.destroy_bitstream_buffer(self.encoder, self.output_bitstream) };
             }
-            .result_without_string();
-        }
-        if !self.encoder.is_null() {
-            let _ = unsafe { (ENCODE_API.destroy_encoder)(self.encoder) }.result_without_string();
+            if !self.encoder.is_null() {
+                let _ = unsafe { api.destroy_encoder(self.encoder) };
+            }
         }
     }
 }
@@ -791,15 +1101,19 @@ impl<T> NvencRegisteredResource<T> {
         T: AsRef<NvencCudaImportedFrame>,
     {
         let imported = marker.as_ref();
-        let mut register_resource = NV_ENC_REGISTER_RESOURCE::new(
-            NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
-            descriptor.width,
-            descriptor.height,
-            imported.device_ptr as *mut c_void,
-            descriptor.buffer_format(),
-        )
-        .pitch(pitch);
-        let status = unsafe { (ENCODE_API.register_resource)(encoder, &mut register_resource) };
+        let api = nvenc_api()?;
+        let mut register_resource = NV_ENC_REGISTER_RESOURCE {
+            version: NV_ENC_REGISTER_RESOURCE_VER,
+            resourceType: NV_ENC_INPUT_RESOURCE_TYPE::NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR,
+            width: descriptor.width,
+            height: descriptor.height,
+            pitch,
+            resourceToRegister: imported.device_ptr as *mut c_void,
+            registeredResource: ptr::null_mut(),
+            bufferFormat: descriptor.buffer_format(),
+            ..Default::default()
+        };
+        let status = unsafe { api.register_resource(encoder, &mut register_resource) };
         nvenc_encode_result(
             status,
             encoder,
@@ -813,7 +1127,7 @@ impl<T> NvencRegisteredResource<T> {
             mappedBufferFmt: NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_UNDEFINED,
             ..Default::default()
         };
-        let status = unsafe { (ENCODE_API.map_input_resource)(encoder, &mut map_input) };
+        let status = unsafe { api.map_input_resource(encoder, &mut map_input) };
         nvenc_encode_result(status, encoder, "failed to map NVENC input resource")?;
 
         Ok(Self {
@@ -837,15 +1151,13 @@ impl<T> NvencRegisteredResource<T> {
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl<T> Drop for NvencRegisteredResource<T> {
     fn drop(&mut self) {
-        if !self.mapped_resource.is_null() {
-            let _ =
-                unsafe { (ENCODE_API.unmap_input_resource)(self.encoder, self.mapped_resource) }
-                    .result_without_string();
-        }
-        if !self.registered_resource.is_null() {
-            let _ =
-                unsafe { (ENCODE_API.unregister_resource)(self.encoder, self.registered_resource) }
-                    .result_without_string();
+        if let Ok(api) = nvenc_api() {
+            if !self.mapped_resource.is_null() {
+                let _ = unsafe { api.unmap_input_resource(self.encoder, self.mapped_resource) };
+            }
+            if !self.registered_resource.is_null() {
+                let _ = unsafe { api.unregister_resource(self.encoder, self.registered_resource) };
+            }
         }
     }
 }
@@ -1203,14 +1515,15 @@ fn row_bytes_for_input(format: NvencInputFormat, width: u32) -> Result<u32, Enco
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn query_nvenc_codecs(encoder: *mut c_void) -> Result<Vec<GUID>, EncodeError> {
+    let api = nvenc_api()?;
     let mut supported_count = 0;
-    let status = unsafe { (ENCODE_API.get_encode_guid_count)(encoder, &mut supported_count) };
+    let status = unsafe { api.get_encode_guid_count(encoder, &mut supported_count) };
     nvenc_init_result(status, encoder, "failed to query NVENC codec count")?;
 
     let mut actual_count = 0;
     let mut encode_guids = vec![GUID::default(); supported_count as usize];
     let status = unsafe {
-        (ENCODE_API.get_encode_guids)(
+        api.get_encode_guids(
             encoder,
             encode_guids.as_mut_ptr(),
             supported_count,
@@ -1227,16 +1540,16 @@ fn query_nvenc_input_formats(
     encoder: *mut c_void,
     codec_guid: GUID,
 ) -> Result<Vec<NV_ENC_BUFFER_FORMAT>, EncodeError> {
+    let api = nvenc_api()?;
     let mut format_count = 0;
-    let status =
-        unsafe { (ENCODE_API.get_input_format_count)(encoder, codec_guid, &mut format_count) };
+    let status = unsafe { api.get_input_format_count(encoder, codec_guid, &mut format_count) };
     nvenc_init_result(status, encoder, "failed to query NVENC input-format count")?;
 
     let mut actual_count = 0;
     let mut formats =
         vec![NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_UNDEFINED; format_count as usize];
     let status = unsafe {
-        (ENCODE_API.get_input_formats)(
+        api.get_input_formats(
             encoder,
             codec_guid,
             formats.as_mut_ptr(),
@@ -1256,6 +1569,7 @@ fn query_nvenc_preset_config(
     preset_guid: GUID,
     tuning_info: NV_ENC_TUNING_INFO,
 ) -> Result<NV_ENC_PRESET_CONFIG, EncodeError> {
+    let api = nvenc_api()?;
     let mut preset_config = NV_ENC_PRESET_CONFIG {
         version: NV_ENC_PRESET_CONFIG_VER,
         presetCfg: NV_ENC_CONFIG {
@@ -1265,7 +1579,7 @@ fn query_nvenc_preset_config(
         ..Default::default()
     };
     let status = unsafe {
-        (ENCODE_API.get_encode_preset_config_ex)(
+        api.get_encode_preset_config_ex(
             encoder,
             codec_guid,
             preset_guid,
@@ -1292,9 +1606,13 @@ fn nvenc_init_result(
     encoder: *mut c_void,
     action: &str,
 ) -> Result<(), EncodeError> {
-    status
-        .result_without_string()
-        .map_err(|_| EncodeError::InitFailed(nvenc_status_message(status, encoder, action)))
+    if nvenc_status_success(status) {
+        Ok(())
+    } else {
+        Err(EncodeError::InitFailed(nvenc_status_message(
+            status, encoder, action,
+        )))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1303,17 +1621,21 @@ fn nvenc_encode_result(
     encoder: *mut c_void,
     action: &str,
 ) -> Result<(), EncodeError> {
-    status
-        .result_without_string()
-        .map_err(|_| EncodeError::EncodeFailed(nvenc_status_message(status, encoder, action)))
+    if nvenc_status_success(status) {
+        Ok(())
+    } else {
+        Err(EncodeError::EncodeFailed(nvenc_status_message(
+            status, encoder, action,
+        )))
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn nvenc_status_message(status: NVENCSTATUS, encoder: *mut c_void, action: &str) -> String {
-    let base = match status.result_without_string() {
-        Ok(()) => return action.to_owned(),
-        Err(error) => error.to_string(),
-    };
+    if nvenc_status_success(status) {
+        return action.to_owned();
+    }
+    let base = format!("{status:?}");
     match nvenc_last_error_string(encoder) {
         Some(detail) => format!("{action}: {base}: {detail}"),
         None => format!("{action}: {base}"),
@@ -1325,7 +1647,8 @@ fn nvenc_last_error_string(encoder: *mut c_void) -> Option<String> {
     if encoder.is_null() {
         return None;
     }
-    let ptr = unsafe { (ENCODE_API.get_last_error_string)(encoder) };
+    let api = nvenc_api().ok()?;
+    let ptr = unsafe { api.get_last_error_string(encoder) };
     if ptr.is_null() {
         return None;
     }
@@ -1334,6 +1657,11 @@ fn nvenc_last_error_string(encoder: *mut c_void) -> Option<String> {
         .trim()
         .to_owned();
     if text.is_empty() { None } else { Some(text) }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvenc_status_success(status: NVENCSTATUS) -> bool {
+    matches!(status, NVENCSTATUS::NV_ENC_SUCCESS)
 }
 
 #[cfg(test)]

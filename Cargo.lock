@@ -2240,6 +2240,7 @@ name = "ustreamer-encode"
 version = "0.1.0"
 dependencies = [
  "cudarc 0.19.4",
+ "libloading 0.8.9",
  "nvidia-video-codec-sdk",
  "objc2-core-foundation",
  "objc2-core-media",

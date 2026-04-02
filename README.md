@@ -8,7 +8,7 @@ The first fast path is now implemented on macOS: `wgpu` Metal texture → IOSurf
 
 The first Vulkan/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, exports a platform external-memory handle (`OPAQUE_FD` on Linux, `OPAQUE_WIN32` on Windows), and tags each captured frame with an explicit synchronization contract. The default mode remains conservatively `HostSynchronized`, and there is now an opt-in exported timeline semaphore mode that host-signals an external semaphore handle after the capture wait so the CUDA side can exercise a real semaphore import/wait path. That conservative `HostSynchronized` path is now runtime-validated on a real Windows RTX 2070 host.
 
-The first encode-side NVENC path is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, imports both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory, and uses a minimal direct NVENC session to register the imported CUDA pointer and read back encoded HEVC/AV1 bitstreams. The current CUDA import path uses an explicit dedicated-allocation import descriptor rather than `cudarc`'s generic helper so Vulkan's dedicated image allocation contract is preserved. On Windows, exported Vulkan memory/semaphore handles also request explicit read/write access rights for CUDA interop. Decoder-config extraction, GPU-driven semaphore handoff, and true-lossless refine are still pending.
+The first encode-side NVENC path is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, imports both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory, and uses a minimal direct NVENC session to register the imported CUDA pointer and read back encoded HEVC/AV1 bitstreams. The current CUDA import path uses an explicit dedicated-allocation import descriptor rather than `cudarc`'s generic helper so Vulkan's dedicated image allocation contract is preserved. On Windows, exported Vulkan memory/semaphore handles also request explicit read/write access rights for CUDA interop, and the NVENC API entrypoints are now loaded directly from the NVIDIA driver runtime (`nvEncodeAPI64.dll`) instead of depending on SDK import libraries at link time. Decoder-config extraction, GPU-driven semaphore handoff, and true-lossless refine are still pending.
 
 ## Use Cases
 
@@ -119,6 +119,10 @@ What success means today:
 - `HostSynchronized` passing means Vulkan external-memory export, CUDA import, and at least one synchronous NVENC encode submission are working on that machine.
 - `ExportedTimelineSemaphore` passing means the current host-signaled external semaphore path also reaches the same encode boundary.
 - The probe currently validates raw encoded access-unit output only; decoder-config extraction for browser consumption is still a follow-up step.
+
+Windows note:
+
+- The direct NVENC path now loads `nvEncodeAPI64.dll` from the installed NVIDIA driver at runtime, so a local Video Codec SDK `.lib` import library should not be required just to build or run the probe.
 
 If the probe says a non-NVIDIA adapter was selected, force the process onto the RTX GPU in Windows graphics settings. If timeline mode is reported as skipped, the current `wgpu` Vulkan device did not enable `VK_KHR_external_semaphore_win32`, so only the conservative host-sync path is available on that machine right now.
 

@@ -6,7 +6,7 @@ edition.workspace = true
 
 [features]
 default = []
-nvenc-direct = ["dep:cudarc", "dep:nvidia-video-codec-sdk", "ustreamer-capture/vulkan-external"]
+nvenc-direct = ["dep:cudarc", "dep:libloading", "dep:nvidia-video-codec-sdk", "ustreamer-capture/vulkan-external"]
 
 [dependencies]
 ustreamer-capture = { workspace = true }
@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
 cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }
+libloading = { version = "0.8.9", optional = true }
 nvidia-video-codec-sdk = { version = "0.4.0", optional = true, default-features = false, features = ["ci-check"] }
 
 [dev-dependencies]
