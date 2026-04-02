@@ -4,6 +4,7 @@ members = [
     "crates/ustreamer-capture",
     "crates/ustreamer-demo",
     "crates/ustreamer-encode",
+    "crates/ustreamer-nvenc-probe",
     "crates/ustreamer-transport",
     "crates/ustreamer-input",
     "crates/ustreamer-proto",

@@ -52,6 +52,17 @@ pub enum VulkanExternalSync {
     },
 }
 
+/// Capture-side synchronization strategy for exported Vulkan frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VulkanCaptureSyncMode {
+    /// Wait on the host before returning the frame to encode.
+    #[default]
+    HostSynchronized,
+    /// After the host wait, signal an exportable timeline semaphore and hand its
+    /// external handle to the encode path.
+    ExportedTimelineSemaphore,
+}
+
 /// Vulkan image + exported external-memory handle suitable for a future CUDA/NVENC import step.
 #[derive(Debug)]
 pub struct VulkanExternalImage {
@@ -166,6 +177,8 @@ struct CachedExportTexture {
     resource_id: u64,
     image: vk::Image,
     device_memory: vk::DeviceMemory,
+    sync_semaphore: Option<vk::Semaphore>,
+    next_sync_value: AtomicU64,
     allocation_size: u64,
     width: u32,
     height: u32,
@@ -203,17 +216,33 @@ impl CachedExportTexture {
             _backing_texture: Some(self.texture.clone()),
         }
     }
+
+    fn next_sync_value(&self) -> u64 {
+        self.next_sync_value.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// Zero-copy Vulkan capture entry point for future NVENC integration.
 #[derive(Debug, Default)]
 pub struct VulkanExternalCapture {
     cached: Option<CachedExportTexture>,
+    sync_mode: VulkanCaptureSyncMode,
 }
 
 impl VulkanExternalCapture {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_sync_mode(VulkanCaptureSyncMode::HostSynchronized)
+    }
+
+    pub fn with_sync_mode(sync_mode: VulkanCaptureSyncMode) -> Self {
+        Self {
+            cached: None,
+            sync_mode,
+        }
+    }
+
+    pub fn sync_mode(&self) -> VulkanCaptureSyncMode {
+        self.sync_mode
     }
 
     fn ensure_cached_export_texture<'a>(
@@ -228,7 +257,12 @@ impl VulkanExternalCapture {
             .is_none_or(|cached| !cached.matches_source(texture));
 
         if needs_recreate {
-            self.cached = Some(create_cached_export_texture(instance, device, texture)?);
+            self.cached = Some(create_cached_export_texture(
+                instance,
+                device,
+                texture,
+                self.sync_mode,
+            )?);
         }
 
         self.cached.as_ref().ok_or_else(|| {
@@ -302,6 +336,7 @@ impl FrameCapture for VulkanExternalCapture {
         texture: &wgpu::Texture,
     ) -> Result<CapturedFrame, CaptureError> {
         validate_source_texture(texture)?;
+        let sync_mode = self.sync_mode;
         let cached = self.ensure_cached_export_texture(instance, device, texture)?;
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -316,8 +351,22 @@ impl FrameCapture for VulkanExternalCapture {
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
 
         let handle = export_memory_handle(instance, device, cached.device_memory)?;
+        let sync = match sync_mode {
+            VulkanCaptureSyncMode::HostSynchronized => VulkanExternalSync::HostSynchronized,
+            VulkanCaptureSyncMode::ExportedTimelineSemaphore => {
+                let semaphore = cached.sync_semaphore.ok_or_else(|| {
+                    CaptureError::VulkanInteropFailed(
+                        "cached export texture is missing its exportable timeline semaphore".into(),
+                    )
+                })?;
+                let value = cached.next_sync_value();
+                signal_exported_timeline_semaphore(device, semaphore, value)?;
+                let handle = export_sync_handle(instance, device, semaphore)?;
+                VulkanExternalSync::ExternalSemaphore { handle, value }
+            }
+        };
         Ok(CapturedFrame::VulkanExternalImage(
-            cached.into_frame(handle, VulkanExternalSync::HostSynchronized),
+            cached.into_frame(handle, sync),
         ))
     }
 }
@@ -361,6 +410,7 @@ fn create_cached_export_texture(
     instance: &wgpu::Instance,
     device: &wgpu::Device,
     source_texture: &wgpu::Texture,
+    sync_mode: VulkanCaptureSyncMode,
 ) -> Result<CachedExportTexture, CaptureError> {
     let handle_type = export_handle_type()?;
     let size = source_texture.size();
@@ -377,7 +427,7 @@ fn create_cached_export_texture(
         view_formats: &[],
     };
 
-    let (image, memory, allocation_size, hal_texture) = {
+    let (image, memory, sync_semaphore, allocation_size, hal_texture) = {
         let instance_hal =
             unsafe {
                 instance.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
@@ -391,6 +441,9 @@ fn create_cached_export_texture(
                 )?
             };
         ensure_external_memory_extension(device_hal.enabled_device_extensions())?;
+        if sync_mode == VulkanCaptureSyncMode::ExportedTimelineSemaphore {
+            ensure_external_semaphore_extension(device_hal.enabled_device_extensions())?;
+        }
 
         let raw_instance = instance_hal.shared_instance().raw_instance();
         let raw_device = device_hal.raw_device();
@@ -468,15 +521,28 @@ fn create_cached_export_texture(
             return Err(map_vk_error("vkBindImageMemory", error));
         }
 
+        let sync_semaphore =
+            create_exportable_timeline_semaphore(raw_instance, raw_device, sync_mode)?;
+
         let drop_device = raw_device.clone();
+        let drop_sync_semaphore = sync_semaphore;
         let drop_callback: wgpu::hal::DropCallback = Box::new(move || unsafe {
+            if let Some(semaphore) = drop_sync_semaphore {
+                drop_device.destroy_semaphore(semaphore, None);
+            }
             drop_device.destroy_image(image, None);
             drop_device.free_memory(memory, None);
         });
         let hal_texture =
             unsafe { device_hal.texture_from_raw(image, &hal_desc, Some(drop_callback)) };
 
-        (image, memory, requirements.size, hal_texture)
+        (
+            image,
+            memory,
+            sync_semaphore,
+            requirements.size,
+            hal_texture,
+        )
     };
 
     let texture = unsafe {
@@ -487,6 +553,8 @@ fn create_cached_export_texture(
         resource_id: NEXT_RESOURCE_ID.fetch_add(1, Ordering::Relaxed),
         image,
         device_memory: memory,
+        sync_semaphore,
+        next_sync_value: AtomicU64::new(0),
         allocation_size,
         width: size.width,
         height: size.height,
@@ -538,6 +606,24 @@ fn ensure_external_memory_extension(
     ))
 }
 
+fn ensure_external_semaphore_extension(
+    enabled_extensions: &[&'static std::ffi::CStr],
+) -> Result<(), CaptureError> {
+    #[cfg(target_os = "linux")]
+    if enabled_extensions.contains(&ash::khr::external_semaphore_fd::NAME) {
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    if enabled_extensions.contains(&ash::khr::external_semaphore_win32::NAME) {
+        return Ok(());
+    }
+
+    Err(CaptureError::ExternalMemoryUnavailable(
+        "required Vulkan external-semaphore export extension is not enabled on this device".into(),
+    ))
+}
+
 fn find_device_local_memory_type(
     raw_instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -577,6 +663,71 @@ fn export_handle_type() -> Result<vk::ExternalMemoryHandleTypeFlags, CaptureErro
     {
         return Ok(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
     }
+}
+
+fn export_semaphore_handle_type() -> Result<vk::ExternalSemaphoreHandleTypeFlags, CaptureError> {
+    #[cfg(target_os = "linux")]
+    {
+        return Ok(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32);
+    }
+}
+
+fn create_exportable_timeline_semaphore(
+    raw_instance: &ash::Instance,
+    raw_device: &ash::Device,
+    sync_mode: VulkanCaptureSyncMode,
+) -> Result<Option<vk::Semaphore>, CaptureError> {
+    if sync_mode != VulkanCaptureSyncMode::ExportedTimelineSemaphore {
+        return Ok(None);
+    }
+
+    let handle_type = export_semaphore_handle_type()?;
+    let mut export_info = vk::ExportSemaphoreCreateInfo::default().handle_types(handle_type);
+    let mut timeline_info = vk::SemaphoreTypeCreateInfo::default()
+        .semaphore_type(vk::SemaphoreType::TIMELINE)
+        .initial_value(0);
+
+    #[cfg(target_os = "linux")]
+    let create_info = vk::SemaphoreCreateInfo::default()
+        .push_next(&mut timeline_info)
+        .push_next(&mut export_info);
+    #[cfg(target_os = "windows")]
+    let mut export_win32_info = vk::ExportSemaphoreWin32HandleInfoKHR::default();
+    #[cfg(target_os = "windows")]
+    let create_info = vk::SemaphoreCreateInfo::default()
+        .push_next(&mut timeline_info)
+        .push_next(&mut export_info)
+        .push_next(&mut export_win32_info);
+
+    let semaphore = unsafe { raw_device.create_semaphore(&create_info, None) }
+        .map_err(|error| map_vk_error("vkCreateSemaphore", error))?;
+
+    let _ = raw_instance;
+    Ok(Some(semaphore))
+}
+
+fn signal_exported_timeline_semaphore(
+    device: &wgpu::Device,
+    semaphore: vk::Semaphore,
+    value: u64,
+) -> Result<(), CaptureError> {
+    let device_hal = unsafe {
+        device
+            .as_hal::<wgpu::hal::api::Vulkan>()
+            .ok_or(CaptureError::UnsupportedBackend(
+                "wgpu device is not using Vulkan",
+            ))?
+    };
+    let signal_info = vk::SemaphoreSignalInfo::default()
+        .semaphore(semaphore)
+        .value(value);
+    unsafe { device_hal.raw_device().signal_semaphore(&signal_info) }
+        .map_err(|error| map_vk_error("vkSignalSemaphore", error))
 }
 
 fn export_memory_handle(
@@ -636,5 +787,65 @@ fn export_memory_handle(
             .map_err(|error| map_vk_error("vkGetMemoryWin32HandleKHR", error))?;
         let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
         return Ok(VulkanExternalMemoryHandle::OpaqueWin32Handle(owned_handle));
+    }
+}
+
+fn export_sync_handle(
+    instance: &wgpu::Instance,
+    device: &wgpu::Device,
+    semaphore: vk::Semaphore,
+) -> Result<VulkanExternalSyncHandle, CaptureError> {
+    #[cfg(target_os = "linux")]
+    {
+        let instance_hal =
+            unsafe {
+                instance.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu instance is not using Vulkan"),
+                )?
+            };
+        let device_hal =
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu device is not using Vulkan"),
+                )?
+            };
+        let external_semaphore = ash::khr::external_semaphore_fd::Device::new(
+            instance_hal.shared_instance().raw_instance(),
+            device_hal.raw_device(),
+        );
+        let get_info = vk::SemaphoreGetFdInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);
+        let fd = unsafe { external_semaphore.get_semaphore_fd(&get_info) }
+            .map_err(|error| map_vk_error("vkGetSemaphoreFdKHR", error))?;
+        let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        return Ok(VulkanExternalSyncHandle::OpaqueFd(owned_fd));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let instance_hal =
+            unsafe {
+                instance.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu instance is not using Vulkan"),
+                )?
+            };
+        let device_hal =
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu device is not using Vulkan"),
+                )?
+            };
+        let external_semaphore = ash::khr::external_semaphore_win32::Device::new(
+            instance_hal.shared_instance().raw_instance(),
+            device_hal.raw_device(),
+        );
+        let get_info = vk::SemaphoreGetWin32HandleInfoKHR::default()
+            .semaphore(semaphore)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_WIN32);
+        let handle = unsafe { external_semaphore.get_semaphore_win32_handle(&get_info) }
+            .map_err(|error| map_vk_error("vkGetSemaphoreWin32HandleKHR", error))?;
+        let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        return Ok(VulkanExternalSyncHandle::OpaqueWin32Handle(owned_handle));
     }
 }

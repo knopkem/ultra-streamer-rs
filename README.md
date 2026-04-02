@@ -6,9 +6,9 @@ Turn your native wgpu render loop into a remotely-accessible, interactive web ap
 
 The first fast path is now implemented on macOS: `wgpu` Metal texture → IOSurface-backed `CVPixelBuffer` → VideoToolbox HEVC, with extracted `hvcC` decoder configuration for browser-side WebCodecs setup.
 
-The first Vulkan/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, exports a platform external-memory handle (`OPAQUE_FD` on Linux, `OPAQUE_WIN32` on Windows), and tags each captured frame with an explicit synchronization contract. Today that sync contract is conservatively `HostSynchronized` because the capture path still waits on the host before handing frames to encode.
+The first Vulkan/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, exports a platform external-memory handle (`OPAQUE_FD` on Linux, `OPAQUE_WIN32` on Windows), and tags each captured frame with an explicit synchronization contract. The default mode remains conservatively `HostSynchronized`, and there is now an opt-in exported timeline semaphore mode that host-signals an external semaphore handle after the capture wait so the CUDA side can exercise a real semaphore import/wait path.
 
-The first encode-side NVENC groundwork is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, carries explicit sync descriptors (`HostSynchronized` today, future external semaphore handoff later), and can import both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory via `cudarc`. Replacing the current host-synchronized handoff with exported GPU semaphores, plus actual NVENC session/bitstream output, are still pending.
+The first encode-side NVENC groundwork is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, carries explicit sync descriptors, imports both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory via `cudarc`, and includes a project-local CUDA external-semaphore shim for exported sync handles. A fully GPU-driven Vulkan→CUDA handoff plus actual NVENC session/bitstream output are still pending.
 
 ## Use Cases
 
@@ -26,6 +26,7 @@ crates/
 ├── ustreamer-capture    # GPU frame capture (zero-copy Metal/NVENC + staging fallback)
 ├── ustreamer-demo       # Headless macOS live-test server (wgpu + VideoToolbox + browser client)
 ├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, GStreamer)
+├── ustreamer-nvenc-probe # Windows Vulkan→CUDA/NVENC validation harness
 ├── ustreamer-transport  # WebTransport server/session layer + WebSocket fallback
 ├── ustreamer-input      # Browser input → application action mapping
 ├── ustreamer-proto      # Shared wire protocol types (frames, input, quality, control JSON)
@@ -45,8 +46,9 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Zero-copy frame capture** from wgpu render targets (Metal IOSurface, Vulkan/CUDA interop)
 - **Hardware video encoding** at up to 4K@60fps with < 3ms encode latency
 - **macOS VideoToolbox HEVC backend** with native length-prefixed access units and `hvcC` decoder-config extraction
-- **Feature-gated Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, exports `OPAQUE_FD` (Linux) or `OPAQUE_WIN32` (Windows) handles, and marks frames with an explicit synchronization contract
+- **Feature-gated Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, exports `OPAQUE_FD` (Linux) or `OPAQUE_WIN32` (Windows) handles, and supports both conservative host-sync and opt-in exported-timeline-semaphore handoff modes
 - **Feature-gated CUDA import + NVENC descriptor-prep backend** — validates exported Vulkan frames, builds direct-NVENC import/rate-control/sync descriptors, and imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory
+- **Windows NVENC probe binary** — forces Vulkan, uploads a known test texture, validates `HostSynchronized` plus optional exported-timeline-semaphore capture, checks CUDA import/wait, and confirms the current encode placeholder boundary
 - **WebTransport + WebCodecs** for lowest possible browser delivery latency
 - **WebSocket fallback transport** for browsers or environments without WebTransport
 - **Settle refinement groundwork** — quality-controller mode switching and forced keyframes on idle refine
@@ -96,3 +98,26 @@ Demo controls:
 cargo build
 cargo test
 ```
+
+## Windows NVENC Probe
+
+On a Windows machine with an NVIDIA GPU, you can now validate the current direct path up to CUDA import with:
+
+```bash
+cargo run -p ustreamer-nvenc-probe -- --sync-mode both
+```
+
+Useful options:
+
+- `--cuda-device 0` to pick a different CUDA ordinal
+- `--width 1920 --height 1080` to change the probe texture size
+- `--sync-mode host|timeline|both` to isolate the conservative handoff or the exported timeline semaphore path
+- `--skip-encode-boundary-check` if you only want capture + CUDA import
+
+What success means today:
+
+- `HostSynchronized` passing means Vulkan external-memory export and CUDA import are working on that machine.
+- `ExportedTimelineSemaphore` passing means the current host-signaled external semaphore path is also working.
+- The final `encode()` check is expected to stop at the current placeholder boundary after CUDA import succeeds; full NVENC session creation, resource registration, and bitstream output are still pending.
+
+If the probe says a non-NVIDIA adapter was selected, force the process onto the RTX GPU in Windows graphics settings. If only the timeline mode fails with an external-semaphore-extension error, the conservative host-sync path is still valid on that machine.

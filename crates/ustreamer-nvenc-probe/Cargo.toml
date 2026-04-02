@@ -1,0 +1,15 @@
+[package]
+name = "ustreamer-nvenc-probe"
+description = "Windows probe for Vulkan external-memory capture and CUDA/NVENC import groundwork"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+pollster = "0.4"
+ustreamer-capture = { workspace = true, features = ["vulkan-external"] }
+ustreamer-encode = { workspace = true, features = ["nvenc-direct"] }
+ustreamer-proto = { workspace = true }
+wgpu = { workspace = true }
