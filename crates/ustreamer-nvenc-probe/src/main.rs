@@ -19,7 +19,7 @@ mod windows_probe {
         VulkanExternalSync,
     };
     use ustreamer_encode::{
-        EncodeError, FrameEncoder,
+        FrameEncoder,
         nvenc::{NvencEncoder, NvencExternalSyncDescriptor},
     };
     use ustreamer_proto::quality::{EncodeMode, EncodeParams};
@@ -266,22 +266,22 @@ mod windows_probe {
         drop(imported);
 
         if options.verify_encode_boundary {
-            match encoder.encode(&frame, &params) {
-                Err(EncodeError::InitFailed(message))
-                    if message.contains("not wired yet")
-                        && message.contains("CUDA import succeeded") =>
-                {
-                    println!("[pass] encode() reached the expected placeholder boundary");
-                }
-                Err(other) => {
-                    bail!("encode() returned an unexpected error: {other}");
-                }
-                Ok(_) => {
-                    bail!(
-                        "encode() unexpectedly produced a bitstream; the current path should stop at the placeholder boundary"
-                    );
-                }
+            let encoded = encoder
+                .encode(&frame, &params)
+                .context("encode() failed after successful CUDA import")?;
+            if encoded.data.is_empty() {
+                bail!("encode() returned an empty bitstream");
             }
+            if !encoded.is_keyframe {
+                bail!("encode() did not return a keyframe for the forced-keyframe probe");
+            }
+            println!(
+                "[pass] NVENC encode produced {} bytes (keyframe={}, refine={}, lossless={})",
+                encoded.data.len(),
+                encoded.is_keyframe,
+                encoded.is_refine,
+                encoded.is_lossless
+            );
         }
 
         println!("[pass] {} complete", capture_sync_mode_name(sync_mode));
@@ -511,7 +511,7 @@ mod windows_probe {
     fn print_help() {
         println!("ustreamer-nvenc-probe");
         println!();
-        println!("Windows probe for Vulkan external-memory export -> CUDA import.");
+        println!("Windows probe for Vulkan external-memory export -> CUDA import -> NVENC encode.");
         println!();
         println!("Usage:");
         println!("  cargo run -p ustreamer-nvenc-probe -- [options]");
@@ -526,7 +526,7 @@ mod windows_probe {
         println!("  --cuda-device <index>             CUDA device ordinal (default: 0)");
         println!("  --sync-mode <host|timeline|both>  Probe sync handoff modes (default: both)");
         println!(
-            "  --skip-encode-boundary-check      Skip the expected placeholder encode() check"
+            "  --skip-encode-boundary-check      Skip the final encode() bitstream validation"
         );
         println!("  -h, --help                        Show this help");
     }
