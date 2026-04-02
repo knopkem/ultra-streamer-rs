@@ -130,6 +130,25 @@ cargo build
 cargo test
 ```
 
+## Crates.io Release Order
+
+The publishable crates are staged to match their internal dependencies:
+
+- `stage1`: `ustreamer-proto`, `ustreamer-capture`
+- `stage2`: `ustreamer-input`, `ustreamer-quality`, `ustreamer-transport`, `ustreamer-encode`
+- `stage3`: `ustreamer-app`
+
+`ustreamer-demo` and `ustreamer-nvenc-probe` are marked `publish = false`.
+
+Use the helper script to rehearse or publish one stage at a time:
+
+```bash
+scripts/publish-crates.sh list
+scripts/publish-crates.sh stage1 --dry-run --allow-dirty
+```
+
+For a real release, publish each stage in order and wait until the previous stage is visible on crates.io before starting the next one.
+
 ## Windows NVENC Probe
 
 On a Windows machine with an NVIDIA GPU, you can now validate the current direct path through CUDA image import and an actual NVENC bitstream encode with:
