@@ -3,6 +3,10 @@ name = "ustreamer-app"
 description = "Integration traits and helpers for wiring wgpu apps into ultra-streamer"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 wgpu = { workspace = true }

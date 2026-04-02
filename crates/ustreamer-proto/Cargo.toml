@@ -3,6 +3,10 @@ name = "ustreamer-proto"
 description = "Shared protocol types for ultra-streamer: frame packets, input events, quality parameters"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 base64 = "0.22"

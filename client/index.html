@@ -29,6 +29,86 @@
       background: #000;
       outline: none;
     }
+    #viewport-native-overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+    }
+    #viewer-tools {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      display: grid;
+      gap: 10px;
+      width: min(320px, calc(100vw - 24px));
+      pointer-events: auto;
+    }
+    #viewer-tools h2 {
+      margin: 0;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    #viewer-tools p {
+      margin: 0;
+      color: #94a3b8;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    #scene-state {
+      color: #cbd5e1;
+      font-size: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+    #mode-buttons {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    #mode-buttons button.active {
+      background: linear-gradient(180deg, #2563eb, #1d4ed8);
+      border-color: rgba(96, 165, 250, 0.4);
+    }
+    #native-crosshair {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 56px;
+      height: 56px;
+      transform: translate(-50%, -50%);
+      opacity: 0;
+      transition: opacity 120ms ease;
+    }
+    #native-crosshair.visible {
+      opacity: 1;
+    }
+    #native-crosshair .line {
+      position: absolute;
+      background: rgba(248, 250, 252, 0.9);
+      box-shadow: 0 0 12px rgba(15, 23, 42, 0.45);
+    }
+    #native-crosshair .horizontal {
+      left: 0;
+      right: 0;
+      top: 50%;
+      height: 2px;
+      transform: translateY(-50%);
+    }
+    #native-crosshair .vertical {
+      top: 0;
+      bottom: 0;
+      left: 50%;
+      width: 2px;
+      transform: translateX(-50%);
+    }
+    #native-crosshair .ring {
+      position: absolute;
+      inset: 16px;
+      border: 2px solid rgba(248, 250, 252, 0.78);
+      border-radius: 999px;
+      box-shadow: 0 0 14px rgba(15, 23, 42, 0.45);
+    }
     #hud {
       position: absolute;
       top: 12px;
@@ -179,13 +259,40 @@
     }
   </style>
 </head>
-<body>
-  <div id="viewer-container">
-    <canvas id="viewer" width="1920" height="1080" tabindex="0"></canvas>
+  <body>
+    <div id="viewer-container">
+      <canvas id="viewer" width="1920" height="1080" tabindex="0"></canvas>
 
-    <div id="hud">
-      <div class="panel">
-        <div id="status">Client loaded. Configure the transport endpoint and connect.</div>
+      <div id="viewport-native-overlay">
+        <div id="viewer-tools" class="panel">
+          <div>
+            <h2>Viewport overlay</h2>
+            <p>
+              Crosshair and mode controls render natively in the browser so they do not consume
+              encoded pixels in the streamed viewport.
+            </p>
+          </div>
+          <div id="scene-state">Mode: rotate
+Pointer: idle</div>
+          <div id="mode-buttons">
+            <button id="mode-rotate" class="secondary active" type="button" data-mode="rotate">Rotate</button>
+            <button id="mode-pan" class="secondary" type="button" data-mode="pan">Pan</button>
+            <button id="mode-zoom" class="secondary" type="button" data-mode="zoom">Zoom</button>
+            <button id="mode-adjust" class="secondary" type="button" data-mode="drag adjust">Adjust</button>
+          </div>
+          <button id="reset-scene" class="secondary" type="button">Reset scene</button>
+        </div>
+
+        <div id="native-crosshair" aria-hidden="true">
+          <span class="line horizontal"></span>
+          <span class="line vertical"></span>
+          <span class="ring"></span>
+        </div>
+      </div>
+
+      <div id="hud">
+        <div class="panel">
+          <div id="status">Client loaded. Configure the transport endpoint and connect.</div>
         <div id="metrics"></div>
       </div>
     </div>
@@ -259,6 +366,10 @@
     const connectButton = document.getElementById("connect");
     const disconnectButton = document.getElementById("disconnect");
     const applyDecoderButton = document.getElementById("apply-decoder");
+    const sceneStateElement = document.getElementById("scene-state");
+    const nativeCrosshair = document.getElementById("native-crosshair");
+    const modeButtons = Array.from(document.querySelectorAll("#mode-buttons button[data-mode]"));
+    const resetSceneButton = document.getElementById("reset-scene");
     const ctx = canvas.getContext("2d", { alpha: false });
 
     urlInput.value = defaultTransportUrl();
@@ -306,6 +417,19 @@
       ["F11", 122],
       ["F12", 123],
     ]);
+
+    const overlayModeKeyCodes = new Map([
+      ["rotate", "1".charCodeAt(0)],
+      ["pan", "2".charCodeAt(0)],
+      ["zoom", "3".charCodeAt(0)],
+      ["drag adjust", "4".charCodeAt(0)],
+    ]);
+
+    const overlayState = {
+      activeMode: "rotate",
+      pointer: null,
+      pointerVisible: false,
+    };
 
     class FrameReassembler {
       constructor() {
@@ -826,6 +950,7 @@
             this.applySessionMetrics(message);
           } else if (message.type === "status" && message.message) {
             setStatus(message.message);
+            applyOverlayStatus(message.message);
           } else {
             logLine(`Control: ${text}`);
           }
@@ -994,14 +1119,18 @@
     }
 
     const client = new UltraStreamerClient();
+    renderOverlayState();
+    updateButtons(false);
     client.updateMetrics();
 
     canvas.addEventListener("pointermove", (event) => {
+      const { x, y } = normalizedPointerPosition(event, canvas);
       if (!client.connected) {
+        hideNativeCrosshair();
         return;
       }
 
-      const { x, y } = normalizedPointerPosition(event, canvas);
+      showNativeCrosshair(x, y);
       const buffer = new ArrayBuffer(14);
       const view = new DataView(buffer);
       view.setUint8(0, INPUT_POINTER_MOVE);
@@ -1016,15 +1145,25 @@
       canvas.focus();
       canvas.setPointerCapture(event.pointerId);
       const { x, y } = normalizedPointerPosition(event, canvas);
+      if (client.connected) {
+        showNativeCrosshair(x, y);
+      }
       void client.sendReliable(encodePointerButton(INPUT_POINTER_DOWN, event.button, x, y));
     });
 
     canvas.addEventListener("pointerup", (event) => {
       const { x, y } = normalizedPointerPosition(event, canvas);
+      if (client.connected) {
+        showNativeCrosshair(x, y);
+      }
       void client.sendReliable(encodePointerButton(INPUT_POINTER_UP, event.button, x, y));
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
       }
+    });
+
+    canvas.addEventListener("pointerleave", () => {
+      hideNativeCrosshair();
     });
 
     canvas.addEventListener("wheel", (event) => {
@@ -1057,6 +1196,7 @@
       }
 
       event.preventDefault();
+      applyOverlayKeyCode(keyCode);
       void client.sendReliable(encodeKeyEvent(INPUT_KEY_DOWN, keyCode));
     });
 
@@ -1072,6 +1212,23 @@
 
       event.preventDefault();
       void client.sendReliable(encodeKeyEvent(INPUT_KEY_UP, keyCode));
+    });
+
+    canvas.addEventListener("blur", () => {
+      hideNativeCrosshair();
+    });
+
+    for (const button of modeButtons) {
+      button.addEventListener("click", () => {
+        const keyCode = overlayModeKeyCodes.get(button.dataset.mode);
+        if (typeof keyCode === "number") {
+          void sendOverlayKey(keyCode);
+        }
+      });
+    }
+
+    resetSceneButton.addEventListener("click", () => {
+      void sendOverlayKey("R".charCodeAt(0));
     });
 
     connectButton.addEventListener("click", () => {
@@ -1114,6 +1271,84 @@
     function updateButtons(connected) {
       connectButton.disabled = connected;
       disconnectButton.disabled = !connected;
+      for (const button of modeButtons) {
+        button.disabled = !connected;
+      }
+      resetSceneButton.disabled = !connected;
+      if (!connected) {
+        hideNativeCrosshair();
+      }
+    }
+
+    function renderOverlayState() {
+      const pointerText = overlayState.pointerVisible && overlayState.pointer
+        ? `${(overlayState.pointer.x * 100).toFixed(1)}%, ${(overlayState.pointer.y * 100).toFixed(1)}%`
+        : "idle";
+      sceneStateElement.textContent = `Mode: ${overlayState.activeMode}\nPointer: ${pointerText}`;
+      for (const button of modeButtons) {
+        button.classList.toggle("active", button.dataset.mode === overlayState.activeMode);
+      }
+    }
+
+    function setOverlayMode(mode) {
+      overlayState.activeMode = mode;
+      renderOverlayState();
+    }
+
+    function showNativeCrosshair(x, y) {
+      overlayState.pointer = { x, y };
+      overlayState.pointerVisible = true;
+      nativeCrosshair.style.left = `${(x * 100).toFixed(3)}%`;
+      nativeCrosshair.style.top = `${(y * 100).toFixed(3)}%`;
+      nativeCrosshair.classList.add("visible");
+      renderOverlayState();
+    }
+
+    function hideNativeCrosshair() {
+      overlayState.pointerVisible = false;
+      nativeCrosshair.classList.remove("visible");
+      renderOverlayState();
+    }
+
+    function applyOverlayStatus(message) {
+      const normalized = message.trim().toLowerCase();
+      if (normalized.startsWith("mode 1:")) {
+        setOverlayMode("rotate");
+      } else if (normalized.startsWith("mode 2:")) {
+        setOverlayMode("pan");
+      } else if (normalized.startsWith("mode 3:")) {
+        setOverlayMode("zoom");
+      } else if (normalized.startsWith("mode 4:")) {
+        setOverlayMode("drag adjust");
+      } else if (normalized.startsWith("scene reset")) {
+        setOverlayMode("rotate");
+      }
+    }
+
+    function applyOverlayKeyCode(keyCode) {
+      if (keyCode === "1".charCodeAt(0)) {
+        setOverlayMode("rotate");
+      } else if (keyCode === "2".charCodeAt(0)) {
+        setOverlayMode("pan");
+      } else if (keyCode === "3".charCodeAt(0)) {
+        setOverlayMode("zoom");
+      } else if (keyCode === "4".charCodeAt(0)) {
+        setOverlayMode("drag adjust");
+      } else if (keyCode === "R".charCodeAt(0)) {
+        setOverlayMode("rotate");
+      }
+    }
+
+    async function sendOverlayKey(keyCode) {
+      if (!client.connected) {
+        setStatus("Connect before using the viewport overlay controls.", true);
+        return;
+      }
+
+      canvas.focus();
+      await client.sendReliable(encodeKeyEvent(INPUT_KEY_DOWN, keyCode));
+      await client.sendReliable(encodeKeyEvent(INPUT_KEY_UP, keyCode));
+      applyOverlayKeyCode(keyCode);
     }
 
     function normalizedPointerPosition(event, element) {

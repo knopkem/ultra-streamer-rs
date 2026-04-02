@@ -3,6 +3,11 @@ name = "ustreamer-demo"
 description = "Headless live-test demo for ultra-streamer-rs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
 
 [features]
 default = []

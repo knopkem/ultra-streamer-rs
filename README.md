@@ -58,6 +58,7 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Compact binary input protocol** — sub-millisecond input event delivery
 - **Typed control protocol** — shared decoder-config / status / session-metrics / frame-checksum JSON messages
 - **Browser metrics HUD** — decode timing, frame drops, connection mode, server-fed RTT/encode telemetry, and checksum verification status
+- **Hybrid browser overlay groundwork** — the demo client now renders a per-client native crosshair plus mode/reset controls above the canvas so those UI pixels do not get encoded into the video stream
 - **App integration crate** — `ustreamer-app` now exposes documented traits/helpers for frame sourcing, mapped/raw input sinks, loopback bootstrap endpoints, and optional session lifecycle hooks so adopting `wgpu` apps need less bespoke glue
 - **Headless live-test demo** — offscreen `wgpu` renderer streamed to the bundled browser client on macOS, plus a feature-gated Vulkan/NVENC demo path on Windows/Linux
 - **Multi-client demo broadcast** — multiple browser viewers can attach to the same headless demo stream simultaneously
@@ -85,6 +86,7 @@ The demo currently exercises:
 - headless `wgpu` rendering
 - staging-buffer capture on macOS, Vulkan external-memory capture on Windows/Linux with `nvenc-direct`
 - VideoToolbox HEVC encode on macOS, direct NVENC HEVC/AV1 encode on Windows/Linux with `nvenc-direct`
+- browser-native crosshair and mode/reset viewport overlay so those elements stay per-client and out of the encoded frame
 - WebSocket browser transport
 - WebCodecs decode and interactive input round-trip
 - settle/refine frame signaling in the browser HUD

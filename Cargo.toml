@@ -18,6 +18,8 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.85"
+repository = "https://github.com/knopkem/ultra-streamer-rs"
+homepage = "https://github.com/knopkem/ultra-streamer-rs"
 
 [workspace.dependencies]
 # GPU
@@ -43,10 +45,13 @@ anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 
 # Internal crates
-ustreamer-app = { path = "crates/ustreamer-app" }
-ustreamer-capture = { path = "crates/ustreamer-capture" }
-ustreamer-encode = { path = "crates/ustreamer-encode" }
-ustreamer-transport = { path = "crates/ustreamer-transport" }
-ustreamer-input = { path = "crates/ustreamer-input" }
-ustreamer-proto = { path = "crates/ustreamer-proto" }
-ustreamer-quality = { path = "crates/ustreamer-quality" }
+ustreamer-app = { version = "0.1.0", path = "crates/ustreamer-app" }
+ustreamer-capture = { version = "0.1.0", path = "crates/ustreamer-capture" }
+ustreamer-encode = { version = "0.1.0", path = "crates/ustreamer-encode" }
+ustreamer-transport = { version = "0.1.0", path = "crates/ustreamer-transport" }
+ustreamer-input = { version = "0.1.0", path = "crates/ustreamer-input" }
+ustreamer-proto = { version = "0.1.0", path = "crates/ustreamer-proto" }
+ustreamer-quality = { version = "0.1.0", path = "crates/ustreamer-quality" }
+
+[patch.crates-io]
+nvidia-video-codec-sdk = { path = "vendor/nvidia-video-codec-sdk" }

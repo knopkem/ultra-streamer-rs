@@ -1404,13 +1404,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let scan = 0.5 + 0.5 * sin(world.x * 10.0 + scene.time * 1.8)
                    * cos(world.y * 9.0 - scene.time * 1.1);
 
-  // `screen` comes from raster UVs (bottom-up Y), while `scene.pointer` comes
-  // from browser coordinates (top-down Y). Convert each from its own origin.
-  let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, scene.pointer.y * 2.0 - 1.0);
-  let cursor_delta = abs(screen - pointer);
-  let cursor = (1.0 - smoothstep(0.0, 0.015, cursor_delta.x))
-             + (1.0 - smoothstep(0.0, 0.02, cursor_delta.y));
-
   let grid = 0.08
     * (1.0 - smoothstep(0.0, 0.02, abs(fract(world.x * 3.0 + 0.5) - 0.5)))
     * (1.0 - smoothstep(0.0, 0.02, abs(fract(world.y * 3.0 + 0.5) - 0.5)));
@@ -1420,7 +1413,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   color += ring * vec3<f32>(0.25, 0.35, 0.9);
   color += orb * vec3<f32>(0.95, 0.35, 0.2);
   color += grid * vec3<f32>(0.15, 0.18, 0.22);
-  color += cursor * vec3<f32>(0.95, 0.95, 0.95);
   color *= scene.exposure;
 
   return vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
@@ -1495,13 +1487,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
 
         #[test]
-        fn shader_maps_browser_pointer_y_without_extra_inversion() {
-            assert!(DEMO_SHADER.contains(
-                "let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, scene.pointer.y * 2.0 - 1.0);"
-            ));
-            assert!(!DEMO_SHADER.contains(
-                "let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, 1.0 - scene.pointer.y * 2.0);"
-            ));
+        fn shader_leaves_cursor_overlay_to_browser() {
+            assert!(!DEMO_SHADER.contains("let cursor_delta = abs(screen - pointer);"));
+            assert!(!DEMO_SHADER.contains("color += cursor * vec3<f32>(0.95, 0.95, 0.95);"));
         }
 
         #[cfg(all(

@@ -3,6 +3,10 @@ name = "ustreamer-transport"
 description = "WebTransport server (QUIC/HTTP3 via quinn) with WebSocket fallback"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 ustreamer-proto = { workspace = true }

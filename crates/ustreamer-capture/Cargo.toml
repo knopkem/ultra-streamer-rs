@@ -3,6 +3,10 @@ name = "ustreamer-capture"
 description = "GPU frame capture from wgpu render targets — zero-copy (Metal/NVENC) and staging buffer paths"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 default = []
