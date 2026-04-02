@@ -20,7 +20,7 @@ mod windows_probe {
     };
     use ustreamer_encode::{
         FrameEncoder,
-        nvenc::{NvencEncoder, NvencExternalSyncDescriptor},
+        nvenc::{NvencCodec, NvencEncoder, NvencEncoderConfig, NvencExternalSyncDescriptor},
     };
     use ustreamer_proto::quality::{EncodeMode, EncodeParams};
 
@@ -38,10 +38,41 @@ mod windows_probe {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ProbeCodec {
+        Hevc,
+        Av1,
+    }
+
+    impl ProbeCodec {
+        fn parse(value: &str) -> Result<Self> {
+            match value {
+                "hevc" => Ok(Self::Hevc),
+                "av1" => Ok(Self::Av1),
+                other => bail!("unsupported --codec value {other:?}; expected `hevc` or `av1`"),
+            }
+        }
+
+        fn nvenc_codec(self) -> NvencCodec {
+            match self {
+                Self::Hevc => NvencCodec::Hevc,
+                Self::Av1 => NvencCodec::Av1,
+            }
+        }
+
+        fn name(self) -> &'static str {
+            match self {
+                Self::Hevc => "hevc",
+                Self::Av1 => "av1",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct ProbeOptions {
         width: u32,
         height: u32,
         cuda_device: usize,
+        codec: ProbeCodec,
         sync_mode: RequestedSyncMode,
         verify_encode_boundary: bool,
     }
@@ -81,10 +112,11 @@ mod windows_probe {
     fn run_probe(options: ProbeOptions) -> Result<()> {
         println!("ustreamer-nvenc-probe");
         println!(
-            "Configured probe: {}x{}, cuda_device={}, sync_mode={}",
+            "Configured probe: {}x{}, cuda_device={}, codec={}, sync_mode={}",
             options.width,
             options.height,
             options.cuda_device,
+            options.codec.name(),
             requested_sync_mode_name(options.sync_mode)
         );
 
@@ -96,9 +128,17 @@ mod windows_probe {
             context.adapter_name, context.adapter_vendor, context.backend
         );
 
-        let mut encoder = NvencEncoder::with_cuda_device(options.cuda_device).map_err(|error| {
+        let mut encoder = NvencEncoder::with_config_and_cuda_device(
+            NvencEncoderConfig {
+                codec: options.codec.nvenc_codec(),
+                ..Default::default()
+            },
+            options.cuda_device,
+        )
+        .map_err(|error| {
             anyhow!(
-                "failed to create CUDA importer for device {}: {error}",
+                "failed to create {} CUDA importer for device {}: {error}",
+                options.codec.name(),
                 options.cuda_device
             )
         })?;
@@ -445,6 +485,7 @@ mod windows_probe {
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             cuda_device: 0,
+            codec: ProbeCodec::Hevc,
             sync_mode: RequestedSyncMode::Both,
             verify_encode_boundary: true,
         };
@@ -461,6 +502,12 @@ mod windows_probe {
                 }
                 "--cuda-device" => {
                     options.cuda_device = parse_usize_arg("--cuda-device", args.next())?;
+                }
+                "--codec" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("missing value for --codec"))?;
+                    options.codec = ProbeCodec::parse(&value)?;
                 }
                 "--sync-mode" => {
                     let value = args
@@ -521,6 +568,7 @@ mod windows_probe {
             "  --height <pixels>                 Source texture height (default: {DEFAULT_HEIGHT})"
         );
         println!("  --cuda-device <index>             CUDA device ordinal (default: 0)");
+        println!("  --codec <hevc|av1>                NVENC codec to validate (default: hevc)");
         println!("  --sync-mode <host|timeline|both>  Probe sync handoff modes (default: both)");
         println!(
             "  --skip-encode-boundary-check      Skip the final encode() bitstream validation"

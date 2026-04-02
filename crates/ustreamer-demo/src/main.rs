@@ -40,7 +40,7 @@ mod demo {
         feature = "nvenc-direct",
         any(target_os = "linux", target_os = "windows")
     ))]
-    use ustreamer_encode::nvenc::NvencEncoder;
+    use ustreamer_encode::nvenc::{NvencCodec, NvencEncoder, NvencEncoderConfig, NvencInputFormat};
     #[cfg(target_os = "macos")]
     use ustreamer_encode::videotoolbox::VideoToolboxEncoder;
     use ustreamer_input::{AppAction, InputMapper, InteractionMode};
@@ -64,9 +64,58 @@ mod demo {
 
     type SessionRegistry = Arc<Mutex<Vec<SessionSlot>>>;
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum DemoCodec {
+        #[default]
+        Hevc,
+        Av1,
+    }
+
+    impl DemoCodec {
+        fn parse(value: &str) -> Result<Self> {
+            match value {
+                "hevc" => Ok(Self::Hevc),
+                "av1" => Ok(Self::Av1),
+                other => {
+                    anyhow::bail!("unsupported --codec value `{other}`; expected `hevc` or `av1`")
+                }
+            }
+        }
+
+        fn arg_name(self) -> &'static str {
+            match self {
+                Self::Hevc => "hevc",
+                Self::Av1 => "av1",
+            }
+        }
+
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        fn display_name(self) -> &'static str {
+            match self {
+                Self::Hevc => "HEVC",
+                Self::Av1 => "AV1",
+            }
+        }
+
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        fn nvenc_codec(self) -> NvencCodec {
+            match self {
+                Self::Hevc => NvencCodec::Hevc,
+                Self::Av1 => NvencCodec::Av1,
+            }
+        }
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     struct DemoOptions {
         nvenc_device: usize,
+        codec_override: Option<DemoCodec>,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -77,7 +126,10 @@ mod demo {
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
         ))]
-        NvencDirect { cuda_device: usize },
+        NvencDirect {
+            cuda_device: usize,
+            codec: DemoCodec,
+        },
     }
 
     impl DemoOptions {
@@ -102,14 +154,20 @@ mod demo {
                             format!("invalid --nvenc-device value `{}`", value.as_ref())
                         })?;
                     }
+                    "--codec" => {
+                        let value = args
+                            .next()
+                            .ok_or_else(|| anyhow!("--codec requires a value"))?;
+                        options.codec_override = Some(DemoCodec::parse(value.as_ref())?);
+                    }
                     "--help" | "-h" => {
                         anyhow::bail!(
-                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct] [-- --nvenc-device <ordinal>]"
+                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct] [-- --nvenc-device <ordinal> --codec <hevc|av1>]"
                         );
                     }
                     other => {
                         anyhow::bail!(
-                            "unrecognized argument `{other}`; supported: --nvenc-device <ordinal>"
+                            "unrecognized argument `{other}`; supported: --nvenc-device <ordinal>, --codec <hevc|av1>"
                         );
                     }
                 }
@@ -122,7 +180,11 @@ mod demo {
         fn select(options: DemoOptions) -> Result<Self> {
             #[cfg(target_os = "macos")]
             {
-                let _ = options;
+                if options.codec_override == Some(DemoCodec::Av1) {
+                    anyhow::bail!(
+                        "ustreamer-demo on macOS currently supports `--codec hevc` only; AV1 is not wired into the VideoToolbox demo path yet"
+                    );
+                }
                 return Ok(Self::VideoToolbox);
             }
             #[cfg(all(
@@ -130,16 +192,50 @@ mod demo {
                 any(target_os = "linux", target_os = "windows")
             ))]
             {
+                let supported_codecs = NvencEncoder::supported_codecs_for_cuda_device(
+                    options.nvenc_device,
+                    NvencInputFormat::Bgra8,
+                )
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to probe NVENC codec support on CUDA device {}: {error}",
+                        options.nvenc_device
+                    )
+                })?;
+                let codec = resolve_demo_codec(options.codec_override, &supported_codecs).map_err(
+                    |error| {
+                        anyhow!(
+                            "failed to select NVENC codec for CUDA device {}: {error}",
+                            options.nvenc_device
+                        )
+                    },
+                )?;
+                if let Some(requested_codec) = options.codec_override {
+                    info!(
+                        "Using requested NVENC codec {} on CUDA device {}.",
+                        requested_codec.display_name(),
+                        options.nvenc_device
+                    );
+                } else {
+                    info!(
+                        "Auto-selected NVENC codec {} on CUDA device {} (supported: {}).",
+                        codec.display_name(),
+                        options.nvenc_device,
+                        format_demo_codecs(&supported_codecs)
+                    );
+                }
                 return Ok(Self::NvencDirect {
                     cuda_device: options.nvenc_device,
+                    codec,
                 });
             }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 anyhow::bail!(
-                    "ustreamer-demo on {} requires the `nvenc-direct` feature; run `cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device {}`",
+                    "ustreamer-demo on {} requires the `nvenc-direct` feature; run `cargo run -p ustreamer-demo --features nvenc-direct -- --nvenc-device {} --codec {}`",
                     env::consts::OS,
-                    options.nvenc_device
+                    options.nvenc_device,
+                    options.codec_override.unwrap_or(DemoCodec::Hevc).arg_name()
                 );
             }
             #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -154,8 +250,9 @@ mod demo {
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::NvencDirect { cuda_device } => format!(
-                    "direct NVENC HEVC + Vulkan external capture (cuda_device={cuda_device})"
+                Self::NvencDirect { cuda_device, codec } => format!(
+                    "direct NVENC {} + Vulkan external capture (cuda_device={cuda_device})",
+                    codec.display_name()
                 ),
             }
         }
@@ -189,15 +286,59 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Ok(Box::new(VideoToolboxEncoder::new())),
                 #[cfg(all(feature = "nvenc-direct", any(target_os = "linux", target_os = "windows")))]
-                Self::NvencDirect { cuda_device } => NvencEncoder::with_cuda_device(cuda_device)
+                Self::NvencDirect { cuda_device, codec } => NvencEncoder::with_config_and_cuda_device(
+                    NvencEncoderConfig {
+                        codec: codec.nvenc_codec(),
+                        ..Default::default()
+                    },
+                    cuda_device,
+                )
                     .map(|encoder| Box::new(encoder) as Box<dyn FrameEncoder>)
                     .map_err(|error| {
                         anyhow!(
-                            "failed to create direct NVENC encoder on CUDA device {cuda_device}: {error}"
+                            "failed to create direct NVENC {} encoder on CUDA device {cuda_device}: {error}",
+                            codec.display_name()
                         )
                     }),
             }
         }
+    }
+
+    fn resolve_demo_codec(
+        requested_codec: Option<DemoCodec>,
+        supported_codecs: &[DemoCodec],
+    ) -> Result<DemoCodec> {
+        if let Some(codec) = requested_codec {
+            if supported_codecs.contains(&codec) {
+                return Ok(codec);
+            }
+            anyhow::bail!(
+                "requested codec `{}` is not supported by the detected NVENC device; supported codecs: {}",
+                codec.arg_name(),
+                format_demo_codecs(supported_codecs)
+            );
+        }
+
+        if supported_codecs.contains(&DemoCodec::Av1) {
+            return Ok(DemoCodec::Av1);
+        }
+        if supported_codecs.contains(&DemoCodec::Hevc) {
+            return Ok(DemoCodec::Hevc);
+        }
+        anyhow::bail!(
+            "the detected NVENC device did not report usable HEVC or AV1 support for BGRA input"
+        );
+    }
+
+    fn format_demo_codecs(codecs: &[DemoCodec]) -> String {
+        if codecs.is_empty() {
+            return "none".into();
+        }
+        codecs
+            .iter()
+            .map(|codec| codec.arg_name())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn run() -> Result<()> {
@@ -1100,7 +1241,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   let scan = 0.5 + 0.5 * sin(world.x * 10.0 + scene.time * 1.8)
                    * cos(world.y * 9.0 - scene.time * 1.1);
 
-  let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, 1.0 - scene.pointer.y * 2.0);
+  // `screen` comes from raster UVs (bottom-up Y), while `scene.pointer` comes
+  // from browser coordinates (top-down Y). Convert each from its own origin.
+  let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, scene.pointer.y * 2.0 - 1.0);
   let cursor_delta = abs(screen - pointer);
   let cursor = (1.0 - smoothstep(0.0, 0.015, cursor_delta.x))
              + (1.0 - smoothstep(0.0, 0.02, cursor_delta.y));
@@ -1123,12 +1266,13 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     #[cfg(test)]
     mod tests {
-        use super::DemoOptions;
+        use super::{DEMO_SHADER, DemoCodec, DemoOptions, format_demo_codecs, resolve_demo_codec};
 
         #[test]
         fn parses_default_demo_options() {
             let options = DemoOptions::parse_from_iter(std::iter::empty::<&str>()).unwrap();
             assert_eq!(options.nvenc_device, 0);
+            assert_eq!(options.codec_override, None);
         }
 
         #[test]
@@ -1138,9 +1282,53 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         }
 
         #[test]
+        fn parses_codec_flag() {
+            let options = DemoOptions::parse_from_iter(["--codec", "av1"]).unwrap();
+            assert_eq!(options.codec_override, Some(DemoCodec::Av1));
+        }
+
+        #[test]
+        fn auto_selects_av1_when_supported() {
+            let codec = resolve_demo_codec(None, &[DemoCodec::Hevc, DemoCodec::Av1]).unwrap();
+            assert_eq!(codec, DemoCodec::Av1);
+        }
+
+        #[test]
+        fn auto_falls_back_to_hevc_when_av1_is_unavailable() {
+            let codec = resolve_demo_codec(None, &[DemoCodec::Hevc]).unwrap();
+            assert_eq!(codec, DemoCodec::Hevc);
+        }
+
+        #[test]
+        fn explicit_codec_override_must_be_supported() {
+            let error = resolve_demo_codec(Some(DemoCodec::Av1), &[DemoCodec::Hevc]).unwrap_err();
+            assert!(error.to_string().contains("requested codec `av1`"));
+            assert!(error.to_string().contains("hevc"));
+        }
+
+        #[test]
+        fn formats_supported_codecs_for_logs() {
+            assert_eq!(format_demo_codecs(&[]), "none");
+            assert_eq!(
+                format_demo_codecs(&[DemoCodec::Av1, DemoCodec::Hevc]),
+                "av1, hevc"
+            );
+        }
+
+        #[test]
         fn rejects_unknown_demo_flag() {
             let error = DemoOptions::parse_from_iter(["--bogus"]).unwrap_err();
             assert!(error.to_string().contains("unrecognized argument"));
+        }
+
+        #[test]
+        fn shader_maps_browser_pointer_y_without_extra_inversion() {
+            assert!(DEMO_SHADER.contains(
+                "let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, scene.pointer.y * 2.0 - 1.0);"
+            ));
+            assert!(!DEMO_SHADER.contains(
+                "let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, 1.0 - scene.pointer.y * 2.0);"
+            ));
         }
     }
 }

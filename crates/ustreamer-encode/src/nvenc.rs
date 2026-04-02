@@ -5,8 +5,9 @@
 //! imported CUDA image per frame and reads back encoded HEVC/AV1 bitstreams.
 //! The conservative `HostSynchronized` handoff remains the default runtime path;
 //! HEVC output is normalized into length-prefixed access units with cached
-//! `hvcC` decoder config for browser-side WebCodecs consumption, while true
-//! GPU-driven semaphore handoff, AV1 decoder-config extraction, and
+//! `hvcC` decoder config for browser-side WebCodecs consumption, while the AV1
+//! path now extracts a browser-ready Sequence Header OBU and derives an RFC 6381
+//! codec string for WebCodecs. True GPU-driven semaphore handoff and
 //! backend-specific true-lossless refinement remain pending.
 
 #[cfg(target_os = "linux")]
@@ -56,6 +57,7 @@ use crate::{DecoderConfig, EncodeError, EncodedFrame, FrameEncoder};
 const DEFAULT_HEVC_CODEC: &str = "hvc1.1.6.L153.B0";
 const DEFAULT_AV1_CODEC: &str = "av01.0.08M.08";
 const NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER: u32 = NVENCAPI_VERSION | (1 << 16) | (0x7 << 28);
+const AV1_OBU_TYPE_SEQUENCE_HEADER: u8 = 1;
 const HEVC_NAL_TYPE_VPS: u8 = 32;
 const HEVC_NAL_TYPE_SPS: u8 = 33;
 const HEVC_NAL_TYPE_PPS: u8 = 34;
@@ -385,6 +387,16 @@ pub enum NvencCodec {
     Av1,
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NvencCodec {
+    fn guid(self) -> GUID {
+        match self {
+            Self::Hevc => NV_ENC_CODEC_HEVC_GUID,
+            Self::Av1 => NV_ENC_CODEC_AV1_GUID,
+        }
+    }
+}
+
 /// Exported Vulkan texture format as seen by the future CUDA/NVENC import step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NvencInputFormat {
@@ -492,6 +504,15 @@ impl NvencEncoder {
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             nvenc_session: None,
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn supported_codecs_for_cuda_device(
+        device_ordinal: usize,
+        input_format: NvencInputFormat,
+    ) -> Result<Vec<NvencCodec>, EncodeError> {
+        let query = NvencCapabilityQuery::open(device_ordinal)?;
+        query.supported_codecs_for_input(input_format)
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -814,20 +835,11 @@ impl NvencSessionDescriptor {
     }
 
     fn codec_guid(&self) -> GUID {
-        match self.codec {
-            NvencCodec::Hevc => NV_ENC_CODEC_HEVC_GUID,
-            NvencCodec::Av1 => NV_ENC_CODEC_AV1_GUID,
-        }
+        self.codec.guid()
     }
 
     fn buffer_format(&self) -> NV_ENC_BUFFER_FORMAT {
-        match self.format {
-            // NVENC's ARGB/ABGR enums describe little-endian 32-bit words.
-            // BGRA8 bytes in memory correspond to the ARGB enum, and RGBA8 bytes
-            // correspond to ABGR.
-            NvencInputFormat::Bgra8 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
-            NvencInputFormat::Rgba8 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR,
-        }
+        nvenc_buffer_format_for_input(self.format)
     }
 }
 
@@ -977,7 +989,7 @@ impl NvencRuntimeSession {
     fn query_decoder_config(&self) -> Result<Option<DecoderConfig>, EncodeError> {
         match self.descriptor.codec {
             NvencCodec::Hevc => Ok(Some(self.query_hevc_decoder_config()?)),
-            NvencCodec::Av1 => Ok(None),
+            NvencCodec::Av1 => Ok(Some(self.query_av1_decoder_config()?)),
         }
     }
 
@@ -990,6 +1002,26 @@ impl NvencRuntimeSession {
         })?;
         Ok(DecoderConfig {
             codec: self.codec_string.clone(),
+            description: Some(description),
+            coded_width: self.descriptor.width,
+            coded_height: self.descriptor.height,
+        })
+    }
+
+    fn query_av1_decoder_config(&self) -> Result<DecoderConfig, EncodeError> {
+        let sequence_payload = self.query_sequence_payload()?;
+        let description = extract_av1_sequence_header_obu(&sequence_payload).map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to extract AV1 sequence header OBU from NVENC sequence parameters: {error}"
+            ))
+        })?;
+        let metadata = parse_av1_sequence_header_metadata(&description).map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to parse AV1 sequence header metadata from NVENC sequence parameters: {error}"
+            ))
+        })?;
+        Ok(DecoderConfig {
+            codec: build_av1_codec_string(metadata),
             description: Some(description),
             coded_width: self.descriptor.width,
             coded_height: self.descriptor.height,
@@ -1176,6 +1208,78 @@ impl Drop for NvencRuntimeSession {
 struct NvencBitstreamData {
     data: Vec<u8>,
     picture_type: NV_ENC_PIC_TYPE,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+struct NvencCapabilityQuery {
+    ctx: Arc<CudaContext>,
+    encoder: *mut c_void,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NvencCapabilityQuery {
+    fn open(device_ordinal: usize) -> Result<Self, EncodeError> {
+        let ctx = CudaContext::new(device_ordinal).map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to create CUDA context for capability query: {error}"
+            ))
+        })?;
+        ctx.bind_to_thread().map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to bind CUDA context before probing NVENC capabilities: {error}"
+            ))
+        })?;
+
+        let api = nvenc_api()?;
+        let mut params = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS {
+            version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
+            deviceType: NV_ENC_DEVICE_TYPE::NV_ENC_DEVICE_TYPE_CUDA,
+            apiVersion: NVENCAPI_VERSION,
+            device: ctx.cu_ctx().cast::<c_void>(),
+            ..Default::default()
+        };
+        let mut encoder = ptr::null_mut();
+        let status = unsafe { api.open_encode_session_ex(&mut params, &mut encoder) };
+        nvenc_init_result(
+            status,
+            encoder,
+            "failed to open NVENC encode session for capability query",
+        )?;
+
+        Ok(Self { ctx, encoder })
+    }
+
+    fn supported_codecs_for_input(
+        &self,
+        input_format: NvencInputFormat,
+    ) -> Result<Vec<NvencCodec>, EncodeError> {
+        let supported_guids = query_nvenc_codecs(self.encoder)?;
+        let expected_input_format = nvenc_buffer_format_for_input(input_format);
+        let mut supported_codecs = Vec::new();
+        for codec in [NvencCodec::Av1, NvencCodec::Hevc] {
+            if !supported_guids.contains(&codec.guid()) {
+                continue;
+            }
+            let supported_inputs = query_nvenc_input_formats(self.encoder, codec.guid())?;
+            if supported_inputs.contains(&expected_input_format) {
+                supported_codecs.push(codec);
+            }
+        }
+        Ok(supported_codecs)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for NvencCapabilityQuery {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        if let Ok(api) = nvenc_api() {
+            if !self.encoder.is_null() {
+                let _ = unsafe { api.destroy_encoder(self.encoder) };
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1677,6 +1781,17 @@ fn row_bytes_for_input(format: NvencInputFormat, width: u32) -> Result<u32, Enco
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn nvenc_buffer_format_for_input(format: NvencInputFormat) -> NV_ENC_BUFFER_FORMAT {
+    match format {
+        // NVENC's ARGB/ABGR enums describe little-endian 32-bit words.
+        // BGRA8 bytes in memory correspond to the ARGB enum, and RGBA8 bytes
+        // correspond to ABGR.
+        NvencInputFormat::Bgra8 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ARGB,
+        NvencInputFormat::Rgba8 => NV_ENC_BUFFER_FORMAT::NV_ENC_BUFFER_FORMAT_ABGR,
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn cuda_array_descriptor(
     format: NvencInputFormat,
     width: u32,
@@ -1821,6 +1936,24 @@ struct HevcSpsMetadata {
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Av1SequenceHeaderMetadata {
+    seq_profile: u8,
+    seq_level_idx_0: u8,
+    seq_tier_0: bool,
+    bit_depth: u8,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Av1ObuDescriptor {
+    obu_type: u8,
+    payload_offset: usize,
+    payload_len: usize,
+    end_offset: usize,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 struct BitReader<'a> {
     data: &'a [u8],
     bit_offset: usize,
@@ -1839,11 +1972,15 @@ impl<'a> BitReader<'a> {
         self.read_bits(1).map(|value| value as u8)
     }
 
+    fn read_bool(&mut self) -> Result<bool, String> {
+        self.read_bit().map(|value| value != 0)
+    }
+
     fn read_bits(&mut self, bit_count: u8) -> Result<u64, String> {
         let mut value = 0u64;
         for _ in 0..bit_count {
             if self.bit_offset >= self.data.len().saturating_mul(8) {
-                return Err("unexpected end of HEVC RBSP".into());
+                return Err("unexpected end of bitstream".into());
             }
             let byte = self.data[self.bit_offset / 8];
             let shift = 7 - (self.bit_offset % 8);
@@ -1853,12 +1990,12 @@ impl<'a> BitReader<'a> {
         Ok(value)
     }
 
-    fn read_ue(&mut self) -> Result<u32, String> {
+    fn read_uvlc(&mut self) -> Result<u32, String> {
         let mut leading_zero_bits = 0u32;
         while self.read_bit()? == 0 {
             leading_zero_bits = leading_zero_bits.saturating_add(1);
             if leading_zero_bits > 31 {
-                return Err("HEVC Exp-Golomb value exceeds supported range".into());
+                return Err("unsigned variable-length code exceeds supported range".into());
             }
         }
         let suffix = if leading_zero_bits == 0 {
@@ -1867,6 +2004,10 @@ impl<'a> BitReader<'a> {
             self.read_bits(leading_zero_bits as u8)? as u32
         };
         Ok((1u32 << leading_zero_bits) - 1 + suffix)
+    }
+
+    fn read_ue(&mut self) -> Result<u32, String> {
+        self.read_uvlc()
     }
 }
 
@@ -2005,6 +2146,241 @@ fn find_annex_b_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
         index += 1;
     }
     None
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn extract_av1_sequence_header_obu(sequence_payload: &[u8]) -> Result<Vec<u8>, String> {
+    let mut offset = 0usize;
+    while offset < sequence_payload.len() {
+        let descriptor = parse_av1_obu_at(sequence_payload, offset)?;
+        if descriptor.obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+            return Ok(sequence_payload[offset..descriptor.end_offset].to_vec());
+        }
+        offset = descriptor.end_offset;
+    }
+    Err("AV1 sequence payload did not contain a Sequence Header OBU".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_av1_obu_at(data: &[u8], offset: usize) -> Result<Av1ObuDescriptor, String> {
+    let header = *data
+        .get(offset)
+        .ok_or_else(|| "AV1 OBU header was truncated".to_string())?;
+    if header & 0x80 != 0 {
+        return Err("AV1 OBU header had the forbidden bit set".into());
+    }
+    let obu_type = (header >> 3) & 0x0f;
+    let extension_flag = (header >> 2) & 0x01 != 0;
+    let has_size_field = (header >> 1) & 0x01 != 0;
+
+    let mut payload_offset = offset.saturating_add(1);
+    if extension_flag {
+        if payload_offset >= data.len() {
+            return Err("AV1 OBU extension header was truncated".into());
+        }
+        payload_offset += 1;
+    }
+
+    let payload_len = if has_size_field {
+        let (payload_len, leb128_len) = parse_av1_leb128(
+            data.get(payload_offset..)
+                .ok_or_else(|| "AV1 OBU size field was truncated".to_string())?,
+        )?;
+        payload_offset = payload_offset.saturating_add(leb128_len);
+        payload_len
+    } else {
+        data.len().saturating_sub(payload_offset)
+    };
+
+    let end_offset = payload_offset
+        .checked_add(payload_len)
+        .ok_or_else(|| "AV1 OBU payload length overflowed usize".to_string())?;
+    if end_offset > data.len() {
+        return Err("AV1 OBU payload exceeded the available sequence bytes".into());
+    }
+
+    Ok(Av1ObuDescriptor {
+        obu_type,
+        payload_offset,
+        payload_len,
+        end_offset,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_av1_leb128(data: &[u8]) -> Result<(usize, usize), String> {
+    let mut value = 0usize;
+    let mut shift = 0usize;
+    for (index, &byte) in data.iter().enumerate() {
+        let chunk = usize::from(byte & 0x7f);
+        value |= chunk
+            .checked_shl(shift as u32)
+            .ok_or_else(|| "AV1 leb128 payload length shift overflowed".to_string())?;
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+        shift = shift.saturating_add(7);
+        if shift >= usize::BITS as usize {
+            return Err("AV1 leb128 payload length exceeded usize width".into());
+        }
+    }
+    Err("AV1 leb128 payload length was truncated".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn parse_av1_sequence_header_metadata(
+    sequence_header_obu: &[u8],
+) -> Result<Av1SequenceHeaderMetadata, String> {
+    let descriptor = parse_av1_obu_at(sequence_header_obu, 0)?;
+    if descriptor.obu_type != AV1_OBU_TYPE_SEQUENCE_HEADER {
+        return Err("AV1 decoder config was not a Sequence Header OBU".into());
+    }
+
+    let payload = &sequence_header_obu
+        [descriptor.payload_offset..descriptor.payload_offset + descriptor.payload_len];
+    let mut bits = BitReader::new(payload);
+    let seq_profile = bits.read_bits(3)? as u8;
+    let _still_picture = bits.read_bool()?;
+    let reduced_still_picture_header = bits.read_bool()?;
+
+    let (seq_level_idx_0, seq_tier_0) = if reduced_still_picture_header {
+        (bits.read_bits(5)? as u8, false)
+    } else {
+        let timing_info_present_flag = bits.read_bool()?;
+        let (decoder_model_info_present_flag, buffer_delay_length) = if timing_info_present_flag {
+            skip_av1_timing_info(&mut bits)?
+        } else {
+            (false, 0)
+        };
+        let initial_display_delay_present_flag = bits.read_bool()?;
+        let operating_points_cnt_minus_1 = bits.read_bits(5)? as usize;
+        let mut seq_level_idx_0 = None;
+        let mut seq_tier_0 = false;
+        for operating_point in 0..=operating_points_cnt_minus_1 {
+            let _operating_point_idc = bits.read_bits(12)?;
+            let level = bits.read_bits(5)? as u8;
+            let tier = if level > 7 { bits.read_bool()? } else { false };
+            if operating_point == 0 {
+                seq_level_idx_0 = Some(level);
+                seq_tier_0 = tier;
+            }
+            if decoder_model_info_present_flag {
+                let decoder_model_present_for_this_op = bits.read_bool()?;
+                if decoder_model_present_for_this_op {
+                    bits.read_bits(buffer_delay_length)?;
+                    bits.read_bits(buffer_delay_length)?;
+                    let _low_delay_mode_flag = bits.read_bool()?;
+                }
+            }
+            if initial_display_delay_present_flag {
+                let initial_display_delay_present_for_this_op = bits.read_bool()?;
+                if initial_display_delay_present_for_this_op {
+                    let _initial_display_delay_minus_1 = bits.read_bits(4)?;
+                }
+            }
+        }
+        (
+            seq_level_idx_0.ok_or_else(|| {
+                "AV1 sequence header did not expose operating point 0 metadata".to_string()
+            })?,
+            seq_tier_0,
+        )
+    };
+
+    let frame_width_bits_minus_1 = bits.read_bits(4)? as u8;
+    let frame_height_bits_minus_1 = bits.read_bits(4)? as u8;
+    let _max_frame_width_minus_1 = bits.read_bits(frame_width_bits_minus_1 + 1)?;
+    let _max_frame_height_minus_1 = bits.read_bits(frame_height_bits_minus_1 + 1)?;
+    if !reduced_still_picture_header {
+        let frame_id_numbers_present_flag = bits.read_bool()?;
+        if frame_id_numbers_present_flag {
+            let _delta_frame_id_length_minus_2 = bits.read_bits(4)?;
+            let _additional_frame_id_length_minus_1 = bits.read_bits(3)?;
+        }
+    }
+
+    let _use_128x128_superblock = bits.read_bool()?;
+    let _enable_filter_intra = bits.read_bool()?;
+    let _enable_intra_edge_filter = bits.read_bool()?;
+    if !reduced_still_picture_header {
+        let _enable_interintra_compound = bits.read_bool()?;
+        let _enable_masked_compound = bits.read_bool()?;
+        let _enable_warped_motion = bits.read_bool()?;
+        let _enable_dual_filter = bits.read_bool()?;
+        let enable_order_hint = bits.read_bool()?;
+        if enable_order_hint {
+            let _enable_jnt_comp = bits.read_bool()?;
+            let _enable_ref_frame_mvs = bits.read_bool()?;
+        }
+        let seq_choose_screen_content_tools = bits.read_bool()?;
+        let screen_content_tools_enabled = if seq_choose_screen_content_tools {
+            true
+        } else {
+            bits.read_bool()?
+        };
+        if screen_content_tools_enabled {
+            let seq_choose_integer_mv = bits.read_bool()?;
+            if !seq_choose_integer_mv {
+                let _seq_force_integer_mv = bits.read_bool()?;
+            }
+        }
+        if enable_order_hint {
+            let _order_hint_bits_minus_1 = bits.read_bits(3)?;
+        }
+    }
+
+    let _enable_superres = bits.read_bool()?;
+    let _enable_cdef = bits.read_bool()?;
+    let _enable_restoration = bits.read_bool()?;
+    let high_bitdepth = bits.read_bool()?;
+    let twelve_bit = if seq_profile == 2 && high_bitdepth {
+        bits.read_bool()?
+    } else {
+        false
+    };
+    let bit_depth = if !high_bitdepth {
+        8
+    } else if twelve_bit {
+        12
+    } else {
+        10
+    };
+
+    Ok(Av1SequenceHeaderMetadata {
+        seq_profile,
+        seq_level_idx_0,
+        seq_tier_0,
+        bit_depth,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn skip_av1_timing_info(bits: &mut BitReader<'_>) -> Result<(bool, u8), String> {
+    let _num_units_in_display_tick = bits.read_bits(32)?;
+    let _time_scale = bits.read_bits(32)?;
+    let equal_picture_interval = bits.read_bool()?;
+    if equal_picture_interval {
+        let _num_ticks_per_picture_minus_1 = bits.read_uvlc()?;
+    }
+    let decoder_model_info_present_flag = bits.read_bool()?;
+    if !decoder_model_info_present_flag {
+        return Ok((false, 0));
+    }
+
+    let buffer_delay_length_minus_1 = bits.read_bits(5)? as u8;
+    let _num_units_in_decoding_tick = bits.read_bits(32)?;
+    let _buffer_removal_time_length_minus_1 = bits.read_bits(5)?;
+    let _frame_presentation_time_length_minus_1 = bits.read_bits(5)?;
+    Ok((true, buffer_delay_length_minus_1.saturating_add(1)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_av1_codec_string(metadata: Av1SequenceHeaderMetadata) -> String {
+    let tier = if metadata.seq_tier_0 { 'H' } else { 'M' };
+    format!(
+        "av01.{}.{:02}{}.{:02}",
+        metadata.seq_profile, metadata.seq_level_idx_0, tier, metadata.bit_depth
+    )
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -2183,6 +2559,11 @@ mod tests {
     use ustreamer_proto::quality::EncodeMode;
     use ustreamer_proto::quality::EncodeParams;
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use super::{
+        AV1_OBU_TYPE_SEQUENCE_HEADER, build_av1_codec_string, extract_av1_sequence_header_obu,
+        parse_av1_sequence_header_metadata,
+    };
     use super::{
         HEVC_HVCC_LENGTH_SIZE_MINUS_ONE, HEVC_NAL_TYPE_PPS, HEVC_NAL_TYPE_SPS, HEVC_NAL_TYPE_VPS,
         NvencEncoder, NvencInputFormat, build_hevc_hvcc_description, cuda_array_descriptor,
@@ -2209,6 +2590,13 @@ mod tests {
             &[0x44, 0x01, 0xc1, 0x73, 0xd1, 0x89],
         ]
         .concat()
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn sample_av1_sequence_header_obu() -> Vec<u8> {
+        vec![
+            0x0a, 0x0a, 0x00, 0x00, 0x00, 0x02, 0xaf, 0xff, 0x89, 0x5f, 0x20, 0x08,
+        ]
     }
 
     #[test]
@@ -2320,6 +2708,46 @@ mod tests {
         assert_eq!(description[21] & 0x03, HEVC_HVCC_LENGTH_SIZE_MINUS_ONE);
         assert_eq!(description[22], 3);
         assert_eq!(description[23], 0x80 | HEVC_NAL_TYPE_VPS);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn extracts_av1_sequence_header_obu_from_sequence_payload() {
+        let payload = [
+            &[0x12, 0x00][..],
+            &sample_av1_sequence_header_obu(),
+            &[0x32, 0x01, 0x00],
+        ]
+        .concat();
+
+        let sequence_header = extract_av1_sequence_header_obu(&payload).unwrap();
+
+        assert_eq!(sequence_header, sample_av1_sequence_header_obu());
+        assert_eq!(
+            (sequence_header[0] >> 3) & 0x0f,
+            AV1_OBU_TYPE_SEQUENCE_HEADER
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn parses_av1_sequence_header_metadata_from_sample_obu() {
+        let metadata =
+            parse_av1_sequence_header_metadata(&sample_av1_sequence_header_obu()).unwrap();
+
+        assert_eq!(metadata.seq_profile, 0);
+        assert_eq!(metadata.seq_level_idx_0, 0);
+        assert!(!metadata.seq_tier_0);
+        assert_eq!(metadata.bit_depth, 8);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn builds_av1_codec_string_from_sample_sequence_header() {
+        let metadata =
+            parse_av1_sequence_header_metadata(&sample_av1_sequence_header_obu()).unwrap();
+
+        assert_eq!(build_av1_codec_string(metadata), "av01.0.00M.08");
     }
 
     #[cfg(target_os = "linux")]
