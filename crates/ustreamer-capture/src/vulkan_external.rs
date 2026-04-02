@@ -283,6 +283,23 @@ impl VulkanExternalCapture {
         self.sync_mode
     }
 
+    /// Choose the best currently-usable sync mode for this Vulkan device.
+    ///
+    /// This preserves `HostSynchronized` as the safe default while upgrading to
+    /// exported timeline semaphores only when the required Vulkan export
+    /// extensions are already enabled on the active `wgpu` device.
+    pub fn best_available_sync_mode(
+        device: &wgpu::Device,
+    ) -> Result<VulkanCaptureSyncMode, CaptureError> {
+        let device_hal =
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu device is not using Vulkan"),
+                )?
+            };
+        best_sync_mode_for_enabled_extensions(device_hal.enabled_device_extensions())
+    }
+
     fn ensure_cached_export_texture<'a>(
         &'a mut self,
         instance: &wgpu::Instance,
@@ -829,6 +846,16 @@ fn ensure_external_semaphore_extension(
     ))
 }
 
+fn best_sync_mode_for_enabled_extensions(
+    enabled_extensions: &[&'static std::ffi::CStr],
+) -> Result<VulkanCaptureSyncMode, CaptureError> {
+    ensure_external_memory_extension(enabled_extensions)?;
+    if ensure_external_semaphore_extension(enabled_extensions).is_ok() {
+        return Ok(VulkanCaptureSyncMode::ExportedTimelineSemaphore);
+    }
+    Ok(VulkanCaptureSyncMode::HostSynchronized)
+}
+
 fn find_device_local_memory_type(
     raw_instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -856,6 +883,51 @@ fn find_device_local_memory_type(
 
 fn map_vk_error(operation: &str, error: vk::Result) -> CaptureError {
     CaptureError::VulkanInteropFailed(format!("{operation} failed: {error:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CaptureError, VulkanCaptureSyncMode, best_sync_mode_for_enabled_extensions};
+
+    #[test]
+    fn prefers_timeline_sync_when_memory_and_semaphore_export_are_available() {
+        #[cfg(target_os = "linux")]
+        let enabled_extensions = [
+            ash::khr::external_memory_fd::NAME,
+            ash::khr::external_semaphore_fd::NAME,
+        ];
+        #[cfg(target_os = "windows")]
+        let enabled_extensions = [
+            ash::khr::external_memory_win32::NAME,
+            ash::khr::external_semaphore_win32::NAME,
+        ];
+
+        assert_eq!(
+            best_sync_mode_for_enabled_extensions(&enabled_extensions).unwrap(),
+            VulkanCaptureSyncMode::ExportedTimelineSemaphore
+        );
+    }
+
+    #[test]
+    fn falls_back_to_host_sync_when_only_memory_export_is_available() {
+        #[cfg(target_os = "linux")]
+        let enabled_extensions = [ash::khr::external_memory_fd::NAME];
+        #[cfg(target_os = "windows")]
+        let enabled_extensions = [ash::khr::external_memory_win32::NAME];
+
+        assert_eq!(
+            best_sync_mode_for_enabled_extensions(&enabled_extensions).unwrap(),
+            VulkanCaptureSyncMode::HostSynchronized
+        );
+    }
+
+    #[test]
+    fn rejects_devices_without_external_memory_export_support() {
+        let error = best_sync_mode_for_enabled_extensions(&[]).unwrap_err();
+        assert!(
+            matches!(error, CaptureError::ExternalMemoryUnavailable(message) if message.contains("external-memory"))
+        );
+    }
 }
 
 fn export_handle_type() -> Result<vk::ExternalMemoryHandleTypeFlags, CaptureError> {

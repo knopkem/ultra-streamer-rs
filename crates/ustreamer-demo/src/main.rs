@@ -32,13 +32,13 @@ mod demo {
         drain_mapped_input_events,
     };
     use ustreamer_capture::FrameCapture;
+    #[cfg(target_os = "macos")]
+    use ustreamer_capture::staging::StagingCapture;
     #[cfg(all(
         feature = "nvenc-direct",
         any(target_os = "linux", target_os = "windows")
     ))]
-    use ustreamer_capture::VulkanExternalCapture;
-    #[cfg(target_os = "macos")]
-    use ustreamer_capture::staging::StagingCapture;
+    use ustreamer_capture::{VulkanCaptureSyncMode, VulkanExternalCapture};
     use ustreamer_encode::FrameEncoder;
     #[cfg(all(
         feature = "nvenc-direct",
@@ -132,6 +132,17 @@ mod demo {
             cuda_device: usize,
             codec: DemoCodec,
         },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum DemoCaptureMode {
+        #[default]
+        Standard,
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        VulkanExternal(VulkanCaptureSyncMode),
     }
 
     impl DemoOptions {
@@ -271,7 +282,15 @@ mod demo {
             }
         }
 
-        fn create_capture(self) -> Box<dyn FrameCapture> {
+        fn create_capture(
+            self,
+            renderer: &HeadlessRenderer,
+        ) -> Result<(Box<dyn FrameCapture>, DemoCaptureMode)> {
+            let capture_mode = self.capture_mode(renderer)?;
+            Ok((self.create_capture_with_mode(capture_mode), capture_mode))
+        }
+
+        fn create_capture_with_mode(self, _capture_mode: DemoCaptureMode) -> Box<dyn FrameCapture> {
             match self {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Box::new(StagingCapture::new(3)),
@@ -279,7 +298,13 @@ mod demo {
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::NvencDirect { .. } => Box::new(VulkanExternalCapture::new()),
+                Self::NvencDirect { .. } => {
+                    let sync_mode = match _capture_mode {
+                        DemoCaptureMode::VulkanExternal(sync_mode) => sync_mode,
+                        DemoCaptureMode::Standard => VulkanCaptureSyncMode::HostSynchronized,
+                    };
+                    Box::new(VulkanExternalCapture::with_sync_mode(sync_mode))
+                }
             }
         }
 
@@ -304,6 +329,83 @@ mod demo {
                     }),
             }
         }
+
+        fn capture_mode(self, _renderer: &HeadlessRenderer) -> Result<DemoCaptureMode> {
+            match self {
+                #[cfg(target_os = "macos")]
+                Self::VideoToolbox => Ok(DemoCaptureMode::Standard),
+                #[cfg(all(
+                    feature = "nvenc-direct",
+                    any(target_os = "linux", target_os = "windows")
+                ))]
+                Self::NvencDirect { .. } => {
+                    let sync_mode = VulkanExternalCapture::best_available_sync_mode(_renderer.device())
+                        .map_err(|error| {
+                            anyhow!(
+                                "failed to determine Vulkan external capture sync mode for the active renderer: {error}"
+                            )
+                        })?;
+                    info!(
+                        "Auto-selected Vulkan external capture sync mode {}.",
+                        describe_vulkan_capture_sync_mode(sync_mode)
+                    );
+                    Ok(DemoCaptureMode::VulkanExternal(sync_mode))
+                }
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "nvenc-direct",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    fn describe_vulkan_capture_sync_mode(sync_mode: VulkanCaptureSyncMode) -> &'static str {
+        match sync_mode {
+            VulkanCaptureSyncMode::HostSynchronized => "host-synchronized",
+            VulkanCaptureSyncMode::ExportedTimelineSemaphore => "exported-timeline-semaphore",
+        }
+    }
+
+    fn should_fallback_to_host_sync(_capture_mode: DemoCaptureMode, _message: &str) -> bool {
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            if _capture_mode
+                == DemoCaptureMode::VulkanExternal(VulkanCaptureSyncMode::ExportedTimelineSemaphore)
+            {
+                return _message.to_ascii_lowercase().contains("semaphore");
+            }
+        }
+
+        false
+    }
+
+    fn fallback_to_host_sync_capture(
+        backend: DemoBackend,
+        capture: &mut Box<dyn FrameCapture>,
+        capture_mode: &mut DemoCaptureMode,
+        reason: &str,
+    ) -> bool {
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        {
+            if *capture_mode
+                == DemoCaptureMode::VulkanExternal(VulkanCaptureSyncMode::ExportedTimelineSemaphore)
+            {
+                warn!("{reason} Falling back to host-synchronized Vulkan capture.");
+                *capture_mode =
+                    DemoCaptureMode::VulkanExternal(VulkanCaptureSyncMode::HostSynchronized);
+                *capture = backend.create_capture_with_mode(*capture_mode);
+                return true;
+            }
+        }
+
+        let _ = (backend, capture, capture_mode, reason);
+        false
     }
 
     fn resolve_demo_codec(
@@ -380,7 +482,7 @@ mod demo {
                 backend.renderer_backends(),
             ))
             .context("failed to create headless renderer")?;
-        let mut capture = backend.create_capture();
+        let (mut capture, mut capture_mode) = backend.create_capture(&renderer)?;
         let mut encoder = backend.create_encoder()?;
         let mut scene = DemoScene::default();
         let mut frame_id = 0u32;
@@ -436,20 +538,52 @@ mod demo {
                 .context("failed to render demo frame")?;
 
             let frame_source = renderer.stream_frame_source();
-            let captured_frame = capture
-                .capture(
+            let (frame_checksum, encoded_frame) = loop {
+                let captured_frame = match capture.capture(
                     frame_source.instance,
                     frame_source.device,
                     frame_source.queue,
                     frame_source.texture,
-                )
-                .context("failed to capture rendered frame")?;
-            let frame_checksum = captured_frame
-                .diagnostic_checksum()
-                .context("failed to compute diagnostic checksum")?;
-            let encoded_frame = encoder
-                .encode(&captured_frame, &params)
-                .context("failed to encode captured frame")?;
+                ) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        if should_fallback_to_host_sync(capture_mode, &error_message)
+                            && fallback_to_host_sync_capture(
+                                backend,
+                                &mut capture,
+                                &mut capture_mode,
+                                &format!("Timeline-semaphore capture failed ({error_message})."),
+                            )
+                        {
+                            continue;
+                        }
+                        return Err(anyhow!("failed to capture rendered frame: {error}"));
+                    }
+                };
+                let frame_checksum = captured_frame
+                    .diagnostic_checksum()
+                    .context("failed to compute diagnostic checksum")?;
+                match encoder.encode(&captured_frame, &params) {
+                    Ok(encoded_frame) => break (frame_checksum, encoded_frame),
+                    Err(error) => {
+                        let error_message = error.to_string();
+                        if should_fallback_to_host_sync(capture_mode, &error_message)
+                            && fallback_to_host_sync_capture(
+                                backend,
+                                &mut capture,
+                                &mut capture_mode,
+                                &format!(
+                                    "Timeline-semaphore encode path failed ({error_message})."
+                                ),
+                            )
+                        {
+                            continue;
+                        }
+                        return Err(anyhow!("failed to encode captured frame: {error}"));
+                    }
+                }
+            };
 
             if params.force_keyframe && !encoded_frame.is_keyframe {
                 warn!("encoder ignored forced keyframe request for the current frame");
@@ -1279,6 +1413,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     #[cfg(test)]
     mod tests {
         use super::{DEMO_SHADER, DemoCodec, DemoOptions, format_demo_codecs, resolve_demo_codec};
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        use super::{DemoCaptureMode, should_fallback_to_host_sync};
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        use ustreamer_capture::VulkanCaptureSyncMode;
 
         #[test]
         fn parses_default_demo_options() {
@@ -1340,6 +1484,34 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
             ));
             assert!(!DEMO_SHADER.contains(
                 "let pointer = vec2<f32>(scene.pointer.x * 2.0 - 1.0, 1.0 - scene.pointer.y * 2.0);"
+            ));
+        }
+
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        #[test]
+        fn timeline_mode_falls_back_on_semaphore_errors() {
+            assert!(should_fallback_to_host_sync(
+                DemoCaptureMode::VulkanExternal(VulkanCaptureSyncMode::ExportedTimelineSemaphore),
+                "vkSignalSemaphore failed"
+            ));
+        }
+
+        #[cfg(all(
+            feature = "nvenc-direct",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        #[test]
+        fn host_sync_mode_does_not_trigger_timeline_fallback() {
+            assert!(!should_fallback_to_host_sync(
+                DemoCaptureMode::VulkanExternal(VulkanCaptureSyncMode::HostSynchronized),
+                "vkSignalSemaphore failed"
+            ));
+            assert!(!should_fallback_to_host_sync(
+                DemoCaptureMode::Standard,
+                "vkSignalSemaphore failed"
             ));
         }
     }

@@ -7,8 +7,9 @@
 //! HEVC output is normalized into length-prefixed access units with cached
 //! `hvcC` decoder config for browser-side WebCodecs consumption, while the AV1
 //! path now extracts a browser-ready Sequence Header OBU and derives an RFC 6381
-//! codec string for WebCodecs. True GPU-driven semaphore handoff and
-//! backend-specific true-lossless refinement remain pending.
+//! codec string for WebCodecs. True GPU-driven semaphore handoff remains
+//! pending, while HEVC refine frames now use true lossless NVENC settings when
+//! the active device reports support.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -34,18 +35,21 @@ use cudarc::driver::{
 use libloading::Library;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
-    GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG,
-    NV_ENC_CONFIG_VER, NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER,
-    NV_ENC_DEVICE_TYPE, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
+    GUID, NV_ENC_BUFFER_FORMAT, NV_ENC_CAPS, NV_ENC_CAPS_PARAM, NV_ENC_CAPS_PARAM_VER,
+    NV_ENC_CODEC_AV1_GUID, NV_ENC_CODEC_HEVC_GUID, NV_ENC_CONFIG, NV_ENC_CONFIG_VER,
+    NV_ENC_CREATE_BITSTREAM_BUFFER, NV_ENC_CREATE_BITSTREAM_BUFFER_VER, NV_ENC_DEVICE_TYPE,
+    NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_INITIALIZE_PARAMS, NV_ENC_INITIALIZE_PARAMS_VER,
     NV_ENC_INPUT_RESOURCE_TYPE, NV_ENC_LOCK_BITSTREAM, NV_ENC_LOCK_BITSTREAM_VER,
     NV_ENC_MAP_INPUT_RESOURCE, NV_ENC_MAP_INPUT_RESOURCE_VER, NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
     NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER, NV_ENC_OUTPUT_PTR, NV_ENC_PARAMS_RC_MODE,
     NV_ENC_PIC_FLAGS, NV_ENC_PIC_PARAMS, NV_ENC_PIC_PARAMS_VER, NV_ENC_PIC_STRUCT, NV_ENC_PIC_TYPE,
-    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID,
+    NV_ENC_PRESET_CONFIG, NV_ENC_PRESET_CONFIG_VER, NV_ENC_PRESET_P1_GUID, NV_ENC_QP,
     NV_ENC_REGISTER_RESOURCE, NV_ENC_REGISTER_RESOURCE_VER, NV_ENC_SEQUENCE_PARAM_PAYLOAD,
     NV_ENC_TUNING_INFO, NV_ENCODE_API_FUNCTION_LIST, NV_ENCODE_API_FUNCTION_LIST_VER,
     NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION, NVENCAPI_VERSION, NVENCSTATUS,
 };
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use tracing::warn;
 use ustreamer_capture::{
     CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
     VulkanExternalSyncHandle,
@@ -284,6 +288,18 @@ impl NvencApi {
             .nvEncGetEncodePresetConfigEx
             .expect(NVENC_API_MSG))(
             encoder, codec_guid, preset_guid, tuning_info, preset_config
+        )
+    }
+
+    unsafe fn get_encode_caps(
+        &self,
+        encoder: *mut c_void,
+        codec_guid: GUID,
+        caps_param: *mut NV_ENC_CAPS_PARAM,
+        caps_val: *mut i32,
+    ) -> NVENCSTATUS {
+        (self.function_list.nvEncGetEncodeCaps.expect(NVENC_API_MSG))(
+            encoder, codec_guid, caps_param, caps_val,
         )
     }
 
@@ -626,7 +642,7 @@ impl NvencEncoder {
             })?
             .context()
             .clone();
-        let runtime = NvencRuntimeSession::create(ctx, prepared, self.codec_string())?;
+        let runtime = NvencRuntimeSession::create(ctx, prepared)?;
         self.nvenc_session = Some(NvencSessionState {
             runtime,
             next_input_timestamp: 0,
@@ -858,7 +874,7 @@ struct NvencRuntimeSession {
     encoder: *mut c_void,
     output_bitstream: NV_ENC_OUTPUT_PTR,
     descriptor: NvencSessionDescriptor,
-    codec_string: String,
+    active_lossless: bool,
     decoder_config: Option<DecoderConfig>,
 }
 
@@ -867,11 +883,7 @@ unsafe impl Send for NvencRuntimeSession {}
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 impl NvencRuntimeSession {
-    fn create(
-        ctx: Arc<CudaContext>,
-        prepared: &NvencPreparedFrame,
-        codec_string: &str,
-    ) -> Result<Self, EncodeError> {
+    fn create(ctx: Arc<CudaContext>, prepared: &NvencPreparedFrame) -> Result<Self, EncodeError> {
         let descriptor = NvencSessionDescriptor::from_prepared(prepared);
         ctx.bind_to_thread().map_err(|error| {
             EncodeError::InitFailed(format!(
@@ -884,7 +896,7 @@ impl NvencRuntimeSession {
             encoder: ptr::null_mut(),
             output_bitstream: ptr::null_mut(),
             descriptor,
-            codec_string: codec_string.to_owned(),
+            active_lossless: false,
             decoder_config: None,
         };
         session.open_encode_session()?;
@@ -934,20 +946,23 @@ impl NvencRuntimeSession {
             )));
         }
 
+        let lossless_active = query_requested_lossless_support(self.encoder, &self.descriptor)?;
+        let tuning_info = if lossless_active {
+            NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_LOSSLESS
+        } else {
+            NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY
+        };
         let mut preset_config = query_nvenc_preset_config(
             self.encoder,
             codec_guid,
             NV_ENC_PRESET_P1_GUID,
-            NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            tuning_info,
         )?;
-        preset_config.presetCfg.gopLength = self.descriptor.target_fps.max(1);
-        preset_config.presetCfg.frameIntervalP = 1;
-        preset_config.presetCfg.rcParams.rateControlMode =
-            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
-        preset_config.presetCfg.rcParams.averageBitRate =
-            clamp_u64_to_u32(self.descriptor.average_bitrate_bps);
-        preset_config.presetCfg.rcParams.maxBitRate =
-            clamp_u64_to_u32(self.descriptor.max_bitrate_bps);
+        configure_session_preset(
+            &mut preset_config.presetCfg,
+            &self.descriptor,
+            lossless_active,
+        );
 
         let mut initialize_params = NV_ENC_INITIALIZE_PARAMS {
             version: NV_ENC_INITIALIZE_PARAMS_VER,
@@ -964,7 +979,7 @@ impl NvencRuntimeSession {
             encodeConfig: &mut preset_config.presetCfg,
             maxEncodeWidth: self.descriptor.width,
             maxEncodeHeight: self.descriptor.height,
-            tuningInfo: NV_ENC_TUNING_INFO::NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY,
+            tuningInfo: tuning_info,
             ..Default::default()
         };
         let api = nvenc_api()?;
@@ -983,6 +998,7 @@ impl NvencRuntimeSession {
             "failed to create NVENC output bitstream",
         )?;
         self.output_bitstream = create_bitstream.bitstreamBuffer;
+        self.active_lossless = lossless_active;
         Ok(())
     }
 
@@ -1000,8 +1016,14 @@ impl NvencRuntimeSession {
                 "failed to build HEVC decoder configuration from NVENC sequence parameters: {error}"
             ))
         })?;
+        let codec =
+            build_hevc_codec_string_from_sequence_payload(&sequence_payload).map_err(|error| {
+                EncodeError::InitFailed(format!(
+                    "failed to derive HEVC codec string from NVENC sequence parameters: {error}"
+                ))
+            })?;
         Ok(DecoderConfig {
-            codec: self.codec_string.clone(),
+            codec,
             description: Some(description),
             coded_width: self.descriptor.width,
             coded_height: self.descriptor.height,
@@ -1130,7 +1152,7 @@ impl NvencRuntimeSession {
                 NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_IDR | NV_ENC_PIC_TYPE::NV_ENC_PIC_TYPE_I
             ),
             is_refine: matches!(params.mode, EncodeMode::LosslessRefine),
-            is_lossless: false,
+            is_lossless: self.active_lossless && matches!(params.mode, EncodeMode::LosslessRefine),
             encode_time_us: started_at.elapsed().as_micros().min(u64::MAX as u128) as u64,
         })
     }
@@ -1279,6 +1301,140 @@ impl Drop for NvencCapabilityQuery {
                 let _ = unsafe { api.destroy_encoder(self.encoder) };
             }
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn query_requested_lossless_support(
+    encoder: *mut c_void,
+    descriptor: &NvencSessionDescriptor,
+) -> Result<bool, EncodeError> {
+    if !descriptor.request_lossless {
+        return Ok(false);
+    }
+    if descriptor.codec != NvencCodec::Hevc {
+        warn!(
+            "true NVENC lossless refine is currently limited to HEVC; falling back to high-bitrate {:?} refine",
+            descriptor.codec
+        );
+        return Ok(false);
+    }
+
+    let supports_lossless = match query_nvenc_capability(
+        encoder,
+        descriptor.codec_guid(),
+        NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_LOSSLESS_ENCODE,
+    ) {
+        Ok(value) => value != 0,
+        Err(error) => {
+            warn!(
+                "failed to query NVENC lossless capability; falling back to high-bitrate refine: {error}"
+            );
+            return Ok(false);
+        }
+    };
+    let supports_yuv444 = match query_nvenc_capability(
+        encoder,
+        descriptor.codec_guid(),
+        NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_YUV444_ENCODE,
+    ) {
+        Ok(value) => value != 0,
+        Err(error) => {
+            warn!(
+                "failed to query NVENC 4:4:4 capability; falling back to high-bitrate refine: {error}"
+            );
+            return Ok(false);
+        }
+    };
+
+    if resolve_requested_lossless(descriptor, supports_lossless, supports_yuv444) {
+        return Ok(true);
+    }
+
+    if !supports_lossless {
+        warn!(
+            "NVENC device does not advertise HEVC lossless encode support; falling back to high-bitrate refine"
+        );
+    } else if !supports_yuv444 {
+        warn!(
+            "NVENC device does not advertise HEVC 4:4:4 encode support; falling back to high-bitrate refine"
+        );
+    }
+    Ok(false)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn resolve_requested_lossless(
+    descriptor: &NvencSessionDescriptor,
+    supports_lossless: bool,
+    supports_yuv444: bool,
+) -> bool {
+    descriptor.request_lossless
+        && descriptor.codec == NvencCodec::Hevc
+        && supports_lossless
+        && supports_yuv444
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn query_nvenc_capability(
+    encoder: *mut c_void,
+    codec_guid: GUID,
+    capability: NV_ENC_CAPS,
+) -> Result<i32, EncodeError> {
+    let api = nvenc_api()?;
+    let mut caps_value = 0i32;
+    let mut params = NV_ENC_CAPS_PARAM {
+        version: NV_ENC_CAPS_PARAM_VER,
+        capsToQuery: capability,
+        ..Default::default()
+    };
+    let action = format!("failed to query NVENC capability {capability:?}");
+    let status = unsafe { api.get_encode_caps(encoder, codec_guid, &mut params, &mut caps_value) };
+    nvenc_init_result(status, encoder, &action)?;
+    Ok(caps_value)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn configure_session_preset(
+    config: &mut NV_ENC_CONFIG,
+    descriptor: &NvencSessionDescriptor,
+    lossless_active: bool,
+) {
+    config.gopLength = descriptor.target_fps.max(1);
+    config.frameIntervalP = 1;
+    if lossless_active {
+        apply_hevc_lossless_preset(config);
+    } else {
+        apply_vbr_preset(
+            config,
+            descriptor.average_bitrate_bps,
+            descriptor.max_bitrate_bps,
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn apply_vbr_preset(config: &mut NV_ENC_CONFIG, average_bitrate_bps: u64, max_bitrate_bps: u64) {
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_VBR;
+    config.rcParams.averageBitRate = clamp_u64_to_u32(average_bitrate_bps);
+    config.rcParams.maxBitRate = clamp_u64_to_u32(max_bitrate_bps);
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn apply_hevc_lossless_preset(config: &mut NV_ENC_CONFIG) {
+    config.profileGUID = NV_ENC_HEVC_PROFILE_FREXT_GUID;
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP;
+    config.rcParams.constQP = NV_ENC_QP {
+        qpInterP: 0,
+        qpInterB: 0,
+        qpIntra: 0,
+    };
+    config.rcParams.averageBitRate = 0;
+    config.rcParams.maxBitRate = 0;
+    unsafe {
+        let mut hevc_config = config.encodeCodecConfig.hevcConfig;
+        hevc_config._bitfield_1.set(15usize, 1u8, 1);
+        config.encodeCodecConfig.hevcConfig = hevc_config;
     }
 }
 
@@ -2064,6 +2220,52 @@ fn build_hevc_hvcc_description(sequence_payload: &[u8]) -> Result<Vec<u8>, Strin
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_hevc_codec_string_from_sequence_payload(
+    sequence_payload: &[u8],
+) -> Result<String, String> {
+    let parameter_sets = extract_hevc_parameter_sets(sequence_payload)?;
+    let metadata = parse_hevc_sps_metadata(&parameter_sets.sps)?;
+    Ok(build_hevc_codec_string(metadata))
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn build_hevc_codec_string(metadata: HevcSpsMetadata) -> String {
+    let mut codec = String::from("hvc1.");
+    match metadata.general_profile_space {
+        1 => codec.push('A'),
+        2 => codec.push('B'),
+        3 => codec.push('C'),
+        _ => {}
+    }
+    codec.push_str(&metadata.general_profile_idc.to_string());
+    codec.push('.');
+    codec.push_str(
+        &metadata
+            .general_profile_compatibility_flags
+            .reverse_bits()
+            .to_string(),
+    );
+    codec.push('.');
+    codec.push(if metadata.general_tier_flag { 'H' } else { 'L' });
+    codec.push_str(&metadata.general_level_idc.to_string());
+
+    let mut constraint_bytes =
+        metadata.general_constraint_indicator_flags.to_be_bytes()[2..].to_vec();
+    while constraint_bytes.last() == Some(&0) {
+        constraint_bytes.pop();
+    }
+    if !constraint_bytes.is_empty() {
+        codec.push('.');
+        for byte in constraint_bytes {
+            use std::fmt::Write as _;
+            let _ = write!(codec, "{byte:02X}");
+        }
+    }
+
+    codec
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn append_hvcc_array(description: &mut Vec<u8>, nal_type: u8, nal_unit: &[u8]) {
     description.push(0x80 | (nal_type & 0x3f));
     description.extend_from_slice(&1u16.to_be_bytes());
@@ -2561,7 +2763,8 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use super::{
-        AV1_OBU_TYPE_SEQUENCE_HEADER, build_av1_codec_string, extract_av1_sequence_header_obu,
+        AV1_OBU_TYPE_SEQUENCE_HEADER, build_av1_codec_string,
+        build_hevc_codec_string_from_sequence_payload, extract_av1_sequence_header_obu,
         parse_av1_sequence_header_metadata,
     };
     use super::{
@@ -2571,6 +2774,10 @@ mod tests {
     };
     #[cfg(target_os = "linux")]
     use super::{NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor};
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use nvidia_video_codec_sdk::sys::nvEncodeAPI::{
+        NV_ENC_CONFIG, NV_ENC_CONFIG_VER, NV_ENC_HEVC_PROFILE_FREXT_GUID, NV_ENC_PARAMS_RC_MODE,
+    };
     use ustreamer_capture::CapturedFrame;
 
     fn sample_hevc_sequence_payload() -> Vec<u8> {
@@ -2708,6 +2915,66 @@ mod tests {
         assert_eq!(description[21] & 0x03, HEVC_HVCC_LENGTH_SIZE_MINUS_ONE);
         assert_eq!(description[22], 3);
         assert_eq!(description[23], 0x80 | HEVC_NAL_TYPE_VPS);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn builds_hevc_codec_string_from_sequence_payload() {
+        assert_eq!(
+            build_hevc_codec_string_from_sequence_payload(&sample_hevc_sequence_payload()).unwrap(),
+            "hvc1.1.6.L153.B0"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn resolves_lossless_only_for_supported_hevc_sessions() {
+        let descriptor = super::NvencSessionDescriptor {
+            codec: super::NvencCodec::Hevc,
+            width: 1920,
+            height: 1080,
+            format: NvencInputFormat::Bgra8,
+            target_fps: 60,
+            average_bitrate_bps: 1,
+            max_bitrate_bps: 1,
+            request_lossless: true,
+        };
+
+        assert!(super::resolve_requested_lossless(&descriptor, true, true));
+        assert!(!super::resolve_requested_lossless(&descriptor, false, true));
+        assert!(!super::resolve_requested_lossless(&descriptor, true, false));
+        assert!(!super::resolve_requested_lossless(
+            &super::NvencSessionDescriptor {
+                codec: super::NvencCodec::Av1,
+                ..descriptor.clone()
+            },
+            true,
+            true,
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn applies_hevc_lossless_preset() {
+        let mut config = NV_ENC_CONFIG {
+            version: NV_ENC_CONFIG_VER,
+            ..Default::default()
+        };
+
+        super::apply_hevc_lossless_preset(&mut config);
+
+        assert_eq!(config.profileGUID, NV_ENC_HEVC_PROFILE_FREXT_GUID);
+        assert_eq!(
+            config.rcParams.rateControlMode,
+            NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CONSTQP
+        );
+        assert_eq!(config.rcParams.constQP.qpIntra, 0);
+        assert_eq!(config.rcParams.constQP.qpInterP, 0);
+        assert_eq!(config.rcParams.constQP.qpInterB, 0);
+        assert_eq!(config.rcParams.averageBitRate, 0);
+        assert_eq!(config.rcParams.maxBitRate, 0);
+        let hevc_config = unsafe { config.encodeCodecConfig.hevcConfig };
+        assert_eq!(hevc_config._bitfield_1.get(15usize, 1u8), 1);
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]
