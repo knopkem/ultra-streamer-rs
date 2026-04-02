@@ -2,12 +2,26 @@
 //!
 //! This module does not yet perform CUDA import or invoke the NVIDIA Video Codec
 //! SDK. Instead, it validates exported Vulkan frames and translates them into the
-//! input/resource descriptor shape that the next FFI slice will consume.
+//! input/resource descriptor shape that the next FFI slice will consume. On
+//! Linux and Windows, it can now also import exported Vulkan external-memory
+//! handles into CUDA via `cudarc`, but it still stops short of NVENC session
+//! creation and bitstream output.
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::{fs::File, mem::ManuallyDrop, sync::Arc};
 
-use ustreamer_capture::{CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use cudarc::driver::safe::{CudaContext, DevicePtr, DeviceSlice, MappedBuffer};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use cudarc::driver::{result::DriverError as CudaDriverError, sys};
+use ustreamer_capture::{
+    CapturedFrame, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
+    VulkanExternalSyncHandle,
+};
 use ustreamer_proto::quality::{EncodeMode, EncodeParams};
 
 use crate::{DecoderConfig, EncodeError, EncodedFrame, FrameEncoder};
@@ -38,6 +52,25 @@ pub enum NvencExternalMemoryHandleDescriptor {
     OpaqueWin32Handle(usize),
 }
 
+/// Exported OS synchronization handle representation to hand off to CUDA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NvencExternalSyncHandleDescriptor {
+    #[cfg(target_os = "linux")]
+    OpaqueFd(i32),
+    #[cfg(target_os = "windows")]
+    OpaqueWin32Handle(usize),
+}
+
+/// Encode-side synchronization contract for an exported Vulkan image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NvencExternalSyncDescriptor {
+    HostSynchronized,
+    ExternalSemaphore {
+        handle: NvencExternalSyncHandleDescriptor,
+        value: u64,
+    },
+}
+
 /// Encode-side view of an exported Vulkan image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvencExternalImageDescriptor {
@@ -65,6 +98,7 @@ pub struct NvencRateControl {
 pub struct NvencPreparedFrame {
     pub codec: NvencCodec,
     pub input: NvencExternalImageDescriptor,
+    pub sync: NvencExternalSyncDescriptor,
     pub rate_control: NvencRateControl,
 }
 
@@ -90,6 +124,8 @@ impl Default for NvencEncoderConfig {
 #[derive(Debug, Default)]
 pub struct NvencEncoder {
     config: NvencEncoderConfig,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    cuda_importer: Option<NvencCudaImporter>,
 }
 
 impl NvencEncoder {
@@ -98,7 +134,28 @@ impl NvencEncoder {
     }
 
     pub fn with_config(config: NvencEncoderConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            cuda_importer: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn with_cuda_device(device_ordinal: usize) -> Result<Self, EncodeError> {
+        Self::with_config_and_cuda_device(NvencEncoderConfig::default(), device_ordinal)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn with_config_and_cuda_device(
+        config: NvencEncoderConfig,
+        device_ordinal: usize,
+    ) -> Result<Self, EncodeError> {
+        Ok(Self {
+            config,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            cuda_importer: Some(NvencCudaImporter::new(device_ordinal)?),
+        })
     }
 
     /// Translate an exported Vulkan frame into the descriptor shape the CUDA/NVENC
@@ -120,6 +177,7 @@ impl NvencEncoder {
 
         validate_dimensions(image, params)?;
         let input = prepare_external_image_descriptor(image)?;
+        let sync = prepare_external_sync_descriptor(image.sync())?;
         let rate_control = NvencRateControl {
             target_fps: params.target_fps.max(1),
             average_bitrate_bps: params.bitrate_bps,
@@ -132,12 +190,34 @@ impl NvencEncoder {
         Ok(NvencPreparedFrame {
             codec: self.config.codec,
             input,
+            sync,
             rate_control,
         })
     }
 
     pub fn codec(&self) -> NvencCodec {
         self.config.codec
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn import_to_cuda(
+        &self,
+        frame: &CapturedFrame,
+        params: &EncodeParams,
+    ) -> Result<NvencCudaImportedFrame, EncodeError> {
+        let prepared = self.prepare_frame(frame, params)?;
+        let importer = self.cuda_importer.as_ref().ok_or_else(|| {
+            EncodeError::InitFailed(
+                "CUDA importer is not configured; create NvencEncoder with with_cuda_device(...)"
+                    .into(),
+            )
+        })?;
+        let image = match frame {
+            CapturedFrame::VulkanExternalImage(image) => image,
+            _ => unreachable!("prepare_frame already validated the frame kind"),
+        };
+
+        importer.import_external_image(image, &prepared)
     }
 
     fn codec_string(&self) -> &str {
@@ -155,6 +235,15 @@ impl FrameEncoder for NvencEncoder {
         params: &EncodeParams,
     ) -> Result<EncodedFrame, EncodeError> {
         let prepared = self.prepare_frame(frame, params)?;
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if self.cuda_importer.is_some() {
+            let imported = self.import_to_cuda(frame, params)?;
+            return Err(EncodeError::InitFailed(format!(
+                "direct NVENC bitstream output is not wired yet; CUDA import succeeded for {}x{} frame (device_ptr=0x{:x}, pitch={} bytes) but NVENC session creation and resource registration remain pending",
+                imported.width, imported.height, imported.device_ptr, imported.pitch_bytes
+            )));
+        }
+
         Err(EncodeError::InitFailed(format!(
             "direct NVENC encode path is not wired yet; prepared {:?} {}x{} frame with codec {} but CUDA import/NVENC session creation remain pending",
             prepared.input.format,
@@ -202,6 +291,20 @@ fn prepare_external_image_descriptor(
     })
 }
 
+fn prepare_external_sync_descriptor(
+    sync: &VulkanExternalSync,
+) -> Result<NvencExternalSyncDescriptor, EncodeError> {
+    match sync {
+        VulkanExternalSync::HostSynchronized => Ok(NvencExternalSyncDescriptor::HostSynchronized),
+        VulkanExternalSync::ExternalSemaphore { handle, value } => {
+            Ok(NvencExternalSyncDescriptor::ExternalSemaphore {
+                handle: map_sync_handle(handle)?,
+                value: *value,
+            })
+        }
+    }
+}
+
 fn map_input_format(format: wgpu::TextureFormat) -> Result<NvencInputFormat, EncodeError> {
     match format {
         wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
@@ -225,9 +328,24 @@ fn map_memory_handle(
             NvencExternalMemoryHandleDescriptor::OpaqueFd(fd.as_raw_fd()),
         ),
         #[cfg(target_os = "windows")]
-        _ => Err(EncodeError::UnsupportedConfig(
-            "Windows Vulkan external-memory import is not implemented yet".into(),
-        )),
+        VulkanExternalMemoryHandle::OpaqueWin32Handle(handle) => Ok(
+            NvencExternalMemoryHandleDescriptor::OpaqueWin32Handle(handle.as_raw_handle() as usize),
+        ),
+    }
+}
+
+fn map_sync_handle(
+    handle: &VulkanExternalSyncHandle,
+) -> Result<NvencExternalSyncHandleDescriptor, EncodeError> {
+    match handle {
+        #[cfg(target_os = "linux")]
+        VulkanExternalSyncHandle::OpaqueFd(fd) => {
+            Ok(NvencExternalSyncHandleDescriptor::OpaqueFd(fd.as_raw_fd()))
+        }
+        #[cfg(target_os = "windows")]
+        VulkanExternalSyncHandle::OpaqueWin32Handle(handle) => Ok(
+            NvencExternalSyncHandleDescriptor::OpaqueWin32Handle(handle.as_raw_handle() as usize),
+        ),
     }
 }
 
@@ -244,6 +362,266 @@ fn captured_frame_kind(frame: &CapturedFrame) -> &'static str {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+pub struct NvencCudaImporter {
+    ctx: Arc<CudaContext>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NvencCudaImporter {
+    pub fn new(device_ordinal: usize) -> Result<Self, EncodeError> {
+        let ctx = CudaContext::new(device_ordinal).map_err(|error| {
+            EncodeError::InitFailed(format!("failed to create CUDA context: {error}"))
+        })?;
+        Ok(Self { ctx })
+    }
+
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    pub fn import_external_image(
+        &self,
+        image: &VulkanExternalImage,
+        prepared: &NvencPreparedFrame,
+    ) -> Result<NvencCudaImportedFrame, EncodeError> {
+        let file = file_from_import_handle(image)?;
+        let sync = import_cuda_sync(image.sync(), &self.ctx)?;
+        let external_memory = unsafe {
+            self.ctx
+                .import_external_memory(file, image.allocation_size())
+        }
+        .map_err(|error| {
+            EncodeError::EncodeFailed(format!(
+                "CUDA external-memory import failed for resource {}: {error}",
+                prepared.input.resource_id
+            ))
+        })?;
+        let mapped_buffer = external_memory.map_all().map_err(|error| {
+            EncodeError::EncodeFailed(format!(
+                "CUDA external-memory mapping failed for resource {}: {error}",
+                prepared.input.resource_id
+            ))
+        })?;
+        let stream = self.ctx.default_stream();
+        sync.wait(&stream).map_err(|error| {
+            EncodeError::EncodeFailed(format!(
+                "CUDA synchronization handoff failed for resource {}: {error}",
+                prepared.input.resource_id
+            ))
+        })?;
+        let device_ptr = {
+            let (device_ptr, sync) = mapped_buffer.device_ptr(&stream);
+            drop(sync);
+            device_ptr
+        };
+
+        Ok(NvencCudaImportedFrame {
+            device_ptr,
+            mapped_len: mapped_buffer.len(),
+            pitch_bytes: row_bytes_for_input(prepared.input.format, prepared.input.width)?,
+            width: prepared.input.width,
+            height: prepared.input.height,
+            format: prepared.input.format,
+            sync: prepared.sync.clone(),
+            _cuda_sync: sync,
+            _mapped_buffer: mapped_buffer,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+pub struct NvencCudaImportedFrame {
+    pub device_ptr: u64,
+    pub mapped_len: usize,
+    pub pitch_bytes: u32,
+    pub width: u32,
+    pub height: u32,
+    pub format: NvencInputFormat,
+    pub sync: NvencExternalSyncDescriptor,
+    _cuda_sync: NvencCudaSync,
+    _mapped_buffer: MappedBuffer,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+enum NvencCudaSync {
+    HostSynchronized,
+    ExternalSemaphore(CudaExternalSemaphore),
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl NvencCudaSync {
+    fn wait(&self, stream: &cudarc::driver::safe::CudaStream) -> Result<(), CudaDriverError> {
+        match self {
+            Self::HostSynchronized => Ok(()),
+            Self::ExternalSemaphore(semaphore) => semaphore.wait(stream),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug)]
+struct CudaExternalSemaphore {
+    semaphore: sys::CUexternalSemaphore,
+    wait_value: u64,
+    ctx: Arc<CudaContext>,
+    _file: ManuallyDrop<File>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl CudaExternalSemaphore {
+    fn import(
+        ctx: &Arc<CudaContext>,
+        handle: &VulkanExternalSyncHandle,
+        wait_value: u64,
+    ) -> Result<Self, EncodeError> {
+        ctx.bind_to_thread().map_err(|error| {
+            EncodeError::InitFailed(format!(
+                "failed to bind CUDA context before external semaphore import: {error}"
+            ))
+        })?;
+        let file = file_from_sync_handle(handle)?;
+        let semaphore = import_external_semaphore_from_file(&file).map_err(|error| {
+            EncodeError::EncodeFailed(format!(
+                "failed to import external Vulkan semaphore into CUDA: {error}"
+            ))
+        })?;
+
+        Ok(Self {
+            semaphore,
+            wait_value,
+            ctx: ctx.clone(),
+            _file: ManuallyDrop::new(file),
+        })
+    }
+
+    fn wait(&self, stream: &cudarc::driver::safe::CudaStream) -> Result<(), CudaDriverError> {
+        if self.ctx.cu_ctx() != stream.context().cu_ctx() {
+            return Err(CudaDriverError(
+                sys::cudaError_enum::CUDA_ERROR_INVALID_CONTEXT,
+            ));
+        }
+        self.ctx.bind_to_thread()?;
+        let mut wait_params: sys::CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS =
+            unsafe { std::mem::zeroed() };
+        wait_params.params.fence.value = self.wait_value;
+        unsafe {
+            sys::cuWaitExternalSemaphoresAsync(&self.semaphore, &wait_params, 1, stream.cu_stream())
+        }
+        .result()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl Drop for CudaExternalSemaphore {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        unsafe {
+            let _ = sys::cuDestroyExternalSemaphore(self.semaphore);
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            ManuallyDrop::drop(&mut self._file);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn import_cuda_sync(
+    sync: &VulkanExternalSync,
+    ctx: &Arc<CudaContext>,
+) -> Result<NvencCudaSync, EncodeError> {
+    match sync {
+        VulkanExternalSync::HostSynchronized => Ok(NvencCudaSync::HostSynchronized),
+        VulkanExternalSync::ExternalSemaphore { handle, value } => Ok(
+            NvencCudaSync::ExternalSemaphore(CudaExternalSemaphore::import(ctx, handle, *value)?),
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn file_from_import_handle(image: &VulkanExternalImage) -> Result<File, EncodeError> {
+    let cloned_fd = image.try_clone_opaque_fd().map_err(|error| {
+        EncodeError::EncodeFailed(format!(
+            "failed to clone exported Vulkan opaque FD for CUDA import: {error}"
+        ))
+    })?;
+    Ok(File::from(cloned_fd))
+}
+
+#[cfg(target_os = "windows")]
+fn file_from_import_handle(image: &VulkanExternalImage) -> Result<File, EncodeError> {
+    let cloned_handle = image.try_clone_opaque_win32_handle().map_err(|error| {
+        EncodeError::EncodeFailed(format!(
+            "failed to clone exported Vulkan Win32 handle for CUDA import: {error}"
+        ))
+    })?;
+    Ok(File::from(cloned_handle))
+}
+
+#[cfg(target_os = "linux")]
+fn file_from_sync_handle(handle: &VulkanExternalSyncHandle) -> Result<File, EncodeError> {
+    let cloned_fd = handle.try_clone_opaque_fd().map_err(|error| {
+        EncodeError::EncodeFailed(format!(
+            "failed to clone exported Vulkan sync FD for CUDA import: {error}"
+        ))
+    })?;
+    Ok(File::from(cloned_fd))
+}
+
+#[cfg(target_os = "windows")]
+fn file_from_sync_handle(handle: &VulkanExternalSyncHandle) -> Result<File, EncodeError> {
+    let cloned_handle = handle.try_clone_opaque_win32_handle().map_err(|error| {
+        EncodeError::EncodeFailed(format!(
+            "failed to clone exported Vulkan sync handle for CUDA import: {error}"
+        ))
+    })?;
+    Ok(File::from(cloned_handle))
+}
+
+#[cfg(target_os = "linux")]
+fn import_external_semaphore_from_file(
+    file: &File,
+) -> Result<sys::CUexternalSemaphore, CudaDriverError> {
+    let mut desc: sys::CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC = unsafe { std::mem::zeroed() };
+    desc.type_ =
+        sys::CUexternalSemaphoreHandleType_enum::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD;
+    desc.handle.fd = file.as_raw_fd();
+    let mut semaphore: sys::CUexternalSemaphore = std::ptr::null_mut();
+    unsafe { sys::cuImportExternalSemaphore(&mut semaphore, &desc) }.result()?;
+    Ok(semaphore)
+}
+
+#[cfg(target_os = "windows")]
+fn import_external_semaphore_from_file(
+    file: &File,
+) -> Result<sys::CUexternalSemaphore, CudaDriverError> {
+    let mut desc: sys::CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC = unsafe { std::mem::zeroed() };
+    desc.type_ =
+        sys::CUexternalSemaphoreHandleType_enum::CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32;
+    desc.handle.win32 = sys::CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC_st__bindgen_ty_1__bindgen_ty_1 {
+        handle: file.as_raw_handle(),
+        name: std::ptr::null(),
+    };
+    let mut semaphore: sys::CUexternalSemaphore = std::ptr::null_mut();
+    unsafe { sys::cuImportExternalSemaphore(&mut semaphore, &desc) }.result()?;
+    Ok(semaphore)
+}
+
+fn row_bytes_for_input(format: NvencInputFormat, width: u32) -> Result<u32, EncodeError> {
+    let bytes_per_pixel = match format {
+        NvencInputFormat::Bgra8 | NvencInputFormat::Rgba8 => 4u32,
+    };
+    width.checked_mul(bytes_per_pixel).ok_or_else(|| {
+        EncodeError::UnsupportedConfig(format!(
+            "NVENC input row-bytes overflow for width {width} and format {format:?}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs::File;
@@ -251,7 +629,10 @@ mod tests {
     use ustreamer_capture::VulkanExternalMemoryHandle;
     use ustreamer_proto::quality::{EncodeMode, EncodeParams};
 
-    use super::{NvencEncoder, NvencExternalMemoryHandleDescriptor, NvencInputFormat};
+    use super::{
+        NvencEncoder, NvencExternalMemoryHandleDescriptor, NvencExternalSyncDescriptor,
+        NvencInputFormat,
+    };
     use ustreamer_capture::{CapturedFrame, VulkanExternalImage};
 
     #[test]
@@ -269,6 +650,18 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(error, crate::EncodeError::UnsupportedFrame(message) if message.contains("CpuBuffer"))
+        );
+    }
+
+    #[test]
+    fn computes_row_bytes_for_rgba_inputs() {
+        assert_eq!(
+            super::row_bytes_for_input(NvencInputFormat::Bgra8, 1920).unwrap(),
+            7680
+        );
+        assert_eq!(
+            super::row_bytes_for_input(NvencInputFormat::Rgba8, 1).unwrap(),
+            4
         );
     }
 
@@ -308,6 +701,10 @@ mod tests {
         match prepared.input.memory_handle {
             NvencExternalMemoryHandleDescriptor::OpaqueFd(fd) => assert!(fd >= 0),
         }
+        assert!(matches!(
+            prepared.sync,
+            NvencExternalSyncDescriptor::HostSynchronized
+        ));
         assert_eq!(prepared.rate_control.target_fps, 60);
         assert_eq!(prepared.rate_control.average_bitrate_bps, 40_000_000);
         assert_eq!(prepared.rate_control.max_bitrate_bps, 90_000_000);

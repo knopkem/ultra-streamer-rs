@@ -6,7 +6,7 @@ edition.workspace = true
 
 [features]
 default = []
-nvenc-direct = ["ustreamer-capture/vulkan-external"]
+nvenc-direct = ["dep:cudarc", "ustreamer-capture/vulkan-external"]
 
 [dependencies]
 ustreamer-capture = { workspace = true }
@@ -14,6 +14,7 @@ ustreamer-proto = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 wgpu = { workspace = true }
+cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "fallback-dynamic-loading", "cuda-version-from-build-system", "fallback-latest"], optional = true }
 
 [dev-dependencies]
 ustreamer-capture = { workspace = true, features = ["vulkan-external", "vulkan-external-test-utils"] }

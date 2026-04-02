@@ -15,6 +15,8 @@ use crate::{CaptureError, CapturedFrame, FrameCapture};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "windows")]
+use std::os::windows::io::{AsHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle};
 
 const EXPORT_TEXTURE_LABEL: &str = "ustreamer-vulkan-external";
 
@@ -25,6 +27,29 @@ static NEXT_RESOURCE_ID: AtomicU64 = AtomicU64::new(1);
 pub enum VulkanExternalMemoryHandle {
     #[cfg(target_os = "linux")]
     OpaqueFd(OwnedFd),
+    #[cfg(target_os = "windows")]
+    OpaqueWin32Handle(OwnedHandle),
+}
+
+/// Exported OS handle for a Vulkan external synchronization primitive.
+#[derive(Debug)]
+pub enum VulkanExternalSyncHandle {
+    #[cfg(target_os = "linux")]
+    OpaqueFd(OwnedFd),
+    #[cfg(target_os = "windows")]
+    OpaqueWin32Handle(OwnedHandle),
+}
+
+/// Synchronization contract for an exported Vulkan image.
+#[derive(Debug)]
+pub enum VulkanExternalSync {
+    /// The capture path waited on the host before handing the frame to encode.
+    HostSynchronized,
+    /// A future GPU-only handoff path via exported semaphore handle.
+    ExternalSemaphore {
+        handle: VulkanExternalSyncHandle,
+        value: u64,
+    },
 }
 
 /// Vulkan image + exported external-memory handle suitable for a future CUDA/NVENC import step.
@@ -38,6 +63,7 @@ pub struct VulkanExternalImage {
     height: u32,
     format: wgpu::TextureFormat,
     handle: VulkanExternalMemoryHandle,
+    sync: VulkanExternalSync,
     _backing_texture: Option<wgpu::Texture>,
 }
 
@@ -74,11 +100,64 @@ impl VulkanExternalImage {
         &self.handle
     }
 
+    pub fn sync(&self) -> &VulkanExternalSync {
+        &self.sync
+    }
+
     #[cfg(target_os = "linux")]
     pub fn opaque_fd(&self) -> BorrowedFd<'_> {
         match &self.handle {
             VulkanExternalMemoryHandle::OpaqueFd(fd) => fd.as_fd(),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn try_clone_opaque_fd(&self) -> std::io::Result<OwnedFd> {
+        self.opaque_fd().try_clone_to_owned()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn opaque_win32_handle(&self) -> BorrowedHandle<'_> {
+        match &self.handle {
+            VulkanExternalMemoryHandle::OpaqueWin32Handle(handle) => handle.as_handle(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn try_clone_opaque_win32_handle(&self) -> std::io::Result<OwnedHandle> {
+        self.opaque_win32_handle().try_clone_to_owned()
+    }
+}
+
+impl VulkanExternalSync {
+    pub fn is_host_synchronized(&self) -> bool {
+        matches!(self, Self::HostSynchronized)
+    }
+}
+
+impl VulkanExternalSyncHandle {
+    #[cfg(target_os = "linux")]
+    pub fn opaque_fd(&self) -> BorrowedFd<'_> {
+        match self {
+            VulkanExternalSyncHandle::OpaqueFd(fd) => fd.as_fd(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn try_clone_opaque_fd(&self) -> std::io::Result<OwnedFd> {
+        self.opaque_fd().try_clone_to_owned()
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn opaque_win32_handle(&self) -> BorrowedHandle<'_> {
+        match self {
+            VulkanExternalSyncHandle::OpaqueWin32Handle(handle) => handle.as_handle(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn try_clone_opaque_win32_handle(&self) -> std::io::Result<OwnedHandle> {
+        self.opaque_win32_handle().try_clone_to_owned()
     }
 }
 
@@ -106,7 +185,11 @@ impl CachedExportTexture {
             && texture.sample_count() == 1
     }
 
-    fn into_frame(&self, handle: VulkanExternalMemoryHandle) -> VulkanExternalImage {
+    fn into_frame(
+        &self,
+        handle: VulkanExternalMemoryHandle,
+        sync: VulkanExternalSync,
+    ) -> VulkanExternalImage {
         VulkanExternalImage {
             resource_id: self.resource_id,
             image: self.image,
@@ -116,6 +199,7 @@ impl CachedExportTexture {
             height: self.height,
             format: self.format,
             handle,
+            sync,
             _backing_texture: Some(self.texture.clone()),
         }
     }
@@ -158,7 +242,7 @@ impl VulkanExternalCapture {
 impl VulkanExternalImage {
     #[cfg(feature = "vulkan-external-test-utils")]
     #[doc(hidden)]
-    pub unsafe fn from_raw_export_for_test(
+    pub unsafe fn from_raw_export_with_sync_for_test(
         resource_id: u64,
         raw_image: u64,
         raw_device_memory: u64,
@@ -167,6 +251,7 @@ impl VulkanExternalImage {
         height: u32,
         format: wgpu::TextureFormat,
         handle: VulkanExternalMemoryHandle,
+        sync: VulkanExternalSync,
     ) -> Self {
         Self {
             resource_id,
@@ -177,8 +262,34 @@ impl VulkanExternalImage {
             height,
             format,
             handle,
+            sync,
             _backing_texture: None,
         }
+    }
+
+    #[cfg(feature = "vulkan-external-test-utils")]
+    #[doc(hidden)]
+    pub unsafe fn from_raw_export_for_test(
+        resource_id: u64,
+        raw_image: u64,
+        raw_device_memory: u64,
+        allocation_size: u64,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+        handle: VulkanExternalMemoryHandle,
+    ) -> Self {
+        Self::from_raw_export_with_sync_for_test(
+            resource_id,
+            raw_image,
+            raw_device_memory,
+            allocation_size,
+            width,
+            height,
+            format,
+            handle,
+            VulkanExternalSync::HostSynchronized,
+        )
     }
 }
 
@@ -206,7 +317,7 @@ impl FrameCapture for VulkanExternalCapture {
 
         let handle = export_memory_handle(instance, device, cached.device_memory)?;
         Ok(CapturedFrame::VulkanExternalImage(
-            cached.into_frame(handle),
+            cached.into_frame(handle, VulkanExternalSync::HostSynchronized),
         ))
     }
 }
@@ -323,11 +434,21 @@ fn create_cached_export_texture(
         let mut dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
         let mut export_memory_info =
             vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
+        #[cfg(target_os = "windows")]
+        let mut export_memory_win32_info = vk::ExportMemoryWin32HandleInfoKHR::default();
+        #[cfg(target_os = "linux")]
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
             .memory_type_index(memory_type_index)
             .push_next(&mut dedicated_allocate_info)
             .push_next(&mut export_memory_info);
+        #[cfg(target_os = "windows")]
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut dedicated_allocate_info)
+            .push_next(&mut export_memory_info)
+            .push_next(&mut export_memory_win32_info);
 
         let memory = match unsafe { raw_device.allocate_memory(&allocate_info, None) } {
             Ok(memory) => memory,
@@ -454,9 +575,7 @@ fn export_handle_type() -> Result<vk::ExternalMemoryHandleTypeFlags, CaptureErro
 
     #[cfg(target_os = "windows")]
     {
-        Err(CaptureError::UnsupportedBackend(
-            "Vulkan external-memory export is not implemented on Windows yet",
-        ))
+        return Ok(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
     }
 }
 
@@ -494,9 +613,28 @@ fn export_memory_handle(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = (instance, device, memory);
-        Err(CaptureError::UnsupportedBackend(
-            "Vulkan external-memory export is not implemented on Windows yet",
-        ))
+        let instance_hal =
+            unsafe {
+                instance.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu instance is not using Vulkan"),
+                )?
+            };
+        let device_hal =
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan>().ok_or(
+                    CaptureError::UnsupportedBackend("wgpu device is not using Vulkan"),
+                )?
+            };
+        let external_memory = ash::khr::external_memory_win32::Device::new(
+            instance_hal.shared_instance().raw_instance(),
+            device_hal.raw_device(),
+        );
+        let handle_info = vk::MemoryGetWin32HandleInfoKHR::default()
+            .memory(memory)
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_WIN32);
+        let handle = unsafe { external_memory.get_memory_win32_handle(&handle_info) }
+            .map_err(|error| map_vk_error("vkGetMemoryWin32HandleKHR", error))?;
+        let owned_handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        return Ok(VulkanExternalMemoryHandle::OpaqueWin32Handle(owned_handle));
     }
 }

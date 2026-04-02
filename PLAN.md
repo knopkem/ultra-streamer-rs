@@ -27,10 +27,10 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** typed control-message protocol plus browser metrics dashboard hooks for decode time, frame drops, encode time, and RTT
 - **Implemented:** diagnostic frame checksums over staged CPU frames with browser-side verification HUD plumbing for refine/lossless updates
 - **Implemented:** headless live-test server (`cargo run -p ustreamer-demo`) serving the browser client and streaming an offscreen `wgpu` scene over WebSocket
-- **Implemented:** feature-gated Linux Vulkan external-memory export path that allocates exportable images, wraps them back into `wgpu`, performs a normal `copy_texture_to_texture`, and exports `OPAQUE_FD` handles for future CUDA/NVENC import
-- **Implemented:** feature-gated direct-NVENC encode groundwork that validates exported Vulkan frames and translates them into explicit external-memory/rate-control descriptors for the future CUDA/NVENC FFI layer
+- **Implemented:** feature-gated Vulkan external-memory export path that allocates exportable images, wraps them back into `wgpu`, performs a normal `copy_texture_to_texture`, exports `OPAQUE_FD` handles on Linux plus `OPAQUE_WIN32` handles on Windows for future CUDA/NVENC import, and marks captured frames with an explicit `HostSynchronized` handoff contract
+- **Implemented:** feature-gated direct-NVENC encode groundwork that validates exported Vulkan frames, translates them into explicit external-memory/rate-control/sync descriptors, and imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory via `cudarc`
 - **Implemented:** multi-client demo broadcast over WebSocket with per-viewer initialization and forced keyframes for newly joined viewers
-- **Next up:** CUDA external-memory import + external synchronization + NVENC session/bitstream output on Linux, Windows external-handle parity, and backend-specific true-lossless refine where supported
+- **Next up:** replace the current host-synchronized handoff with exported GPU synchronization on Linux/Windows, then wire NVENC session/bitstream output and backend-specific true-lossless refine where supported
 
 ---
 
@@ -697,8 +697,8 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **input-bridge-rust** *(done)*: Rust-side binary input decode → map to abstract AppAction events for the consumer application
 
 ### Phase 2: NVIDIA + Quality + Lossless
-- **capture-nvenc-zerocopy**: feature-gated `VulkanExternalCapture` now allocates exportable Vulkan images, re-wraps them as `wgpu::Texture`s, copies render targets into them with standard `wgpu` commands, and exports Linux `OPAQUE_FD` handles; remaining work is CUDA external-memory import, external synchronization/ownership handoff, and the Windows handle-export path
-- **encoder-nvenc-direct**: feature-gated `NvencEncoder` module is now in place and can translate exported Vulkan frames into explicit direct-NVENC input/rate-control descriptors; remaining work is the actual CUDA import + NVENC FFI/session wiring and bitstream output
+- **capture-nvenc-zerocopy**: feature-gated `VulkanExternalCapture` now allocates exportable Vulkan images, re-wraps them as `wgpu::Texture`s, copies render targets into them with standard `wgpu` commands, exports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` handles, and marks frames as explicitly `HostSynchronized`; remaining work is replacing that conservative handoff with exported GPU synchronization plus runtime validation on real NVIDIA hosts
+- **encoder-nvenc-direct**: feature-gated `NvencEncoder` module is now in place, can translate exported Vulkan frames into explicit direct-NVENC input/rate-control/sync descriptors, and can import Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory; remaining work is consuming future GPU sync handles in a real NVENC session, resource registration, and bitstream output
 - **lossless-settle** *(done)*: Idle detection → forced high-bitrate refine keyframe, explicit `refine` vs `lossless` signaling on the wire; VideoToolbox remains visually-lossless only, while future backends can mark true lossless frames
 - **lossless-checksum** *(done)*: Server computes diagnostic RGBA checksums for CPU-readable frames, sends them as typed control messages, and the browser verifies decoded output in the HUD; this already proves current VideoToolbox refine frames are not bit-exact, while future true-lossless backends can validate cleanly
 - **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle

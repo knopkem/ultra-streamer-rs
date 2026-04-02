@@ -6,9 +6,9 @@ Turn your native wgpu render loop into a remotely-accessible, interactive web ap
 
 The first fast path is now implemented on macOS: `wgpu` Metal texture → IOSurface-backed `CVPixelBuffer` → VideoToolbox HEVC, with extracted `hvcC` decoder configuration for browser-side WebCodecs setup.
 
-The first Linux/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, and exports an `OPAQUE_FD` handle for future CUDA/NVENC import.
+The first Vulkan/NVIDIA capture slice beyond scaffolding is also in place behind `ustreamer-capture`'s `vulkan-external` feature: `VulkanExternalCapture` now allocates an exportable Vulkan image, wraps it back into `wgpu`, copies into it with normal `wgpu` commands, exports a platform external-memory handle (`OPAQUE_FD` on Linux, `OPAQUE_WIN32` on Windows), and tags each captured frame with an explicit synchronization contract. Today that sync contract is conservatively `HostSynchronized` because the capture path still waits on the host before handing frames to encode.
 
-The first encode-side NVENC groundwork is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames and translates them into explicit external-memory/resource-rate-control descriptors that the future CUDA/NVENC FFI layer will consume. Actual CUDA import, external synchronization, and NVENC session/bitstream output are still pending.
+The first encode-side NVENC groundwork is also feature-gated in `ustreamer-encode` behind `nvenc-direct`: `NvencEncoder` now validates exported Vulkan frames, translates them into explicit external-memory/resource-rate-control descriptors, carries explicit sync descriptors (`HostSynchronized` today, future external semaphore handoff later), and can import both Linux `OPAQUE_FD` and Windows `OPAQUE_WIN32` exports into CUDA device memory via `cudarc`. Replacing the current host-synchronized handoff with exported GPU semaphores, plus actual NVENC session/bitstream output, are still pending.
 
 ## Use Cases
 
@@ -45,8 +45,8 @@ client/                  # Browser client (WebTransport/WebSocket + WebCodecs + 
 - **Zero-copy frame capture** from wgpu render targets (Metal IOSurface, Vulkan/CUDA interop)
 - **Hardware video encoding** at up to 4K@60fps with < 3ms encode latency
 - **macOS VideoToolbox HEVC backend** with native length-prefixed access units and `hvcC` decoder-config extraction
-- **Feature-gated Linux Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, and exports `OPAQUE_FD` handles for future CUDA/NVENC import
-- **Feature-gated NVENC descriptor-prep backend** — validates exported Vulkan frames and builds direct-NVENC import/rate-control descriptors for the next CUDA/NVENC FFI slice
+- **Feature-gated Vulkan external-memory export path** — allocates exportable Vulkan images, wraps them back into `wgpu`, exports `OPAQUE_FD` (Linux) or `OPAQUE_WIN32` (Windows) handles, and marks frames with an explicit synchronization contract
+- **Feature-gated CUDA import + NVENC descriptor-prep backend** — validates exported Vulkan frames, builds direct-NVENC import/rate-control/sync descriptors, and imports Linux `OPAQUE_FD` plus Windows `OPAQUE_WIN32` exports into CUDA device memory
 - **WebTransport + WebCodecs** for lowest possible browser delivery latency
 - **WebSocket fallback transport** for browsers or environments without WebTransport
 - **Settle refinement groundwork** — quality-controller mode switching and forced keyframes on idle refine

@@ -24,7 +24,10 @@ use objc2_io_surface::IOSurfaceRef;
     feature = "vulkan-external",
     any(target_os = "linux", target_os = "windows")
 ))]
-pub use vulkan_external::{VulkanExternalCapture, VulkanExternalImage, VulkanExternalMemoryHandle};
+pub use vulkan_external::{
+    VulkanExternalCapture, VulkanExternalImage, VulkanExternalMemoryHandle, VulkanExternalSync,
+    VulkanExternalSyncHandle,
+};
 
 /// Diagnostic checksum over canonical RGBA8 pixel bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
