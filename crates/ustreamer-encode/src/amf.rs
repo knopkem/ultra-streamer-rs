@@ -524,7 +524,7 @@ fn apply_static_encoder_properties(
     set_component_property_int64(component, HEVC_INPUT_QUEUE_SIZE_PROPERTY, 1)?;
     set_component_property_int64(component, HEVC_QUERY_TIMEOUT_PROPERTY, 0)?;
     set_component_property_bool(component, HEVC_LOW_LATENCY_MODE_PROPERTY, true)?;
-    set_component_property_bool(component, HEVC_INPUT_FULL_RANGE_PROPERTY, true)?;
+    set_component_property_bool(component, HEVC_NOMINAL_RANGE_PROPERTY, true)?;
     set_component_property_size(
         component,
         HEVC_FRAMESIZE_PROPERTY,
@@ -1064,7 +1064,7 @@ const HEVC_FRAMESIZE_PROPERTY: &str = "HevcFrameSize";
 const HEVC_USAGE_PROPERTY: &str = "HevcUsage";
 const HEVC_QUALITY_PRESET_PROPERTY: &str = "HevcQualityPreset";
 const HEVC_LOW_LATENCY_MODE_PROPERTY: &str = "LowLatencyInternal";
-const HEVC_INPUT_FULL_RANGE_PROPERTY: &str = "HevcInputFullRangeColor";
+const HEVC_NOMINAL_RANGE_PROPERTY: &str = "HevcNominalRange";
 const HEVC_GOP_SIZE_PROPERTY: &str = "HevcGOPSize";
 const HEVC_NUM_GOPS_PER_IDR_PROPERTY: &str = "HevcGOPSPerIDR";
 const HEVC_SLICES_PER_FRAME_PROPERTY: &str = "HevcSlicesPerFrame";
