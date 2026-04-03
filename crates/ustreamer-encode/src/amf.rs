@@ -129,6 +129,10 @@ impl AmfEncoder {
             .map(|session| session.dimensions != (width, height))
             .unwrap_or(true);
         if recreate {
+            info!(
+                "AMF session: creating {:?} encoder session for {}x{}.",
+                self.codec, width, height
+            );
             self.session = Some(AmfSession::create(self.codec, params, width, height)?);
             self.decoder_config = None;
             self.frame_index = 0;
@@ -222,10 +226,15 @@ impl AmfSession {
         width: u32,
         height: u32,
     ) -> Result<Self, EncodeError> {
+        info!("AMF session: creating context.");
         let context = create_context()?;
+        info!("AMF session: initializing context.");
         initialize_context(context.as_ptr())?;
+        info!("AMF session: creating encoder component.");
         let component = create_component(context.as_ptr(), codec)?;
+        info!("AMF session: applying static encoder properties.");
         apply_static_encoder_properties(component.as_ptr(), width, height, params)?;
+        info!("AMF session: initializing encoder component.");
         initialize_component(component.as_ptr(), codec, width, height)?;
         let mut session = Self {
             context,
@@ -233,7 +242,9 @@ impl AmfSession {
             dimensions: (width, height),
             dynamic_settings: None,
         };
+        info!("AMF session: applying dynamic encoder properties.");
         session.update_dynamic_properties(params)?;
+        info!("AMF session: ready.");
         Ok(session)
     }
 
