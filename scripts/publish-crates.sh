@@ -17,7 +17,28 @@ Notes:
   - Wait until the previous stage is visible on crates.io before moving on.
   - `--dry-run` is the default mode.
   - `--allow-dirty` is useful for local rehearsal only; do not use it for real releases.
+  - Already-published crate versions are skipped automatically.
 EOF
+}
+
+# Returns 0 if the given crate@version already exists on crates.io.
+is_published() {
+  local crate="$1" version="$2"
+  local http_code
+  http_code=$(curl -sf -o /dev/null -w "%{http_code}" \
+    -A "publish-crates.sh/1.0" \
+    "https://crates.io/api/v1/crates/${crate}/${version}" 2>/dev/null || true)
+  [[ "$http_code" == "200" ]]
+}
+
+# Read the version for a given crate from the workspace Cargo.toml / package manifest.
+crate_version() {
+  local crate="$1"
+  cargo metadata --no-deps --format-version 1 2>/dev/null \
+    | grep -A3 "\"name\":\"${crate}\"" \
+    | grep '"version"' \
+    | head -1 \
+    | sed 's/.*"version":"\([^"]*\)".*/\1/'
 }
 
 if [[ $# -lt 1 ]]; then
@@ -95,6 +116,12 @@ echo "Running $stage in ${mode#--} mode"
 echo "Crates: ${crates[*]}"
 
 for crate in "${crates[@]}"; do
+  version="$(crate_version "$crate")"
+  if [[ "$mode" == "--publish" ]] && is_published "$crate" "$version"; then
+    echo "--- skipping $crate@$version (already on crates.io) ---"
+    continue
+  fi
   echo "--- cargo publish -p $crate ${publish_args[*]+"${publish_args[*]}"} ---"
   cargo publish -p "$crate" ${publish_args[@]+"${publish_args[@]}"}
 done
+
