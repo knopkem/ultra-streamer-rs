@@ -95,6 +95,6 @@ echo "Running $stage in ${mode#--} mode"
 echo "Crates: ${crates[*]}"
 
 for crate in "${crates[@]}"; do
-  echo "--- cargo publish -p $crate ${publish_args[*]} ---"
-  cargo publish -p "$crate" "${publish_args[@]}"
+  echo "--- cargo publish -p $crate ${publish_args[*]+"${publish_args[*]}"} ---"
+  cargo publish -p "$crate" ${publish_args[@]+"${publish_args[@]}"}
 done
