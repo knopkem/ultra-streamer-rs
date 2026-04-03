@@ -20,6 +20,7 @@ use crate::{
 
 const SAMPLE_TIMEOUT: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+const AMF_PROBE_DIMENSIONS: &[(u32, u32)] = &[(128, 128), (1920, 1080)];
 
 #[cfg(target_os = "windows")]
 const AMF_RUNTIME_LIBRARY_CANDIDATES: &[&str] = &["amfrt64.dll"];
@@ -87,13 +88,32 @@ impl AmfEncoder {
 
     pub fn probe() -> Result<AmfCapabilities, EncodeError> {
         let api = amf_api()?;
-        let mut session = AmfSession::create(AmfCodec::Hevc, &EncodeParams::default(), 64, 64)?;
-        session.shutdown();
-        Ok(AmfCapabilities {
-            codec: AmfCodec::Hevc,
-            runtime_version: api.runtime_version,
-            runtime_library: api.runtime_library,
-        })
+        let mut last_error = None;
+        for &(width, height) in AMF_PROBE_DIMENSIONS {
+            match AmfSession::create(AmfCodec::Hevc, &EncodeParams::default(), width, height) {
+                Ok(_session) => {
+                    return Ok(AmfCapabilities {
+                        codec: AmfCodec::Hevc,
+                        runtime_version: api.runtime_version,
+                        runtime_library: api.runtime_library,
+                    });
+                }
+                Err(error) => {
+                    last_error = Some((width, height, error));
+                }
+            }
+        }
+
+        let Some((width, height, error)) = last_error else {
+            return Err(EncodeError::InitFailed(
+                "AMF probe did not attempt any encoder dimensions".into(),
+            ));
+        };
+
+        return Err(EncodeError::InitFailed(format!(
+            "AMF runtime loaded from {} but probe session creation failed at {}x{}: {}",
+            api.runtime_library, width, height, error
+        )));
     }
 
     fn ensure_session(
@@ -469,14 +489,6 @@ fn apply_static_encoder_properties(
     height: u32,
     params: &EncodeParams,
 ) -> Result<(), EncodeError> {
-    set_component_property_size(
-        component,
-        HEVC_FRAMESIZE_PROPERTY,
-        sys::AMFSize {
-            width: width.min(i32::MAX as u32) as i32,
-            height: height.min(i32::MAX as u32) as i32,
-        },
-    )?;
     set_component_property_int64(
         component,
         HEVC_USAGE_PROPERTY,
@@ -513,6 +525,14 @@ fn apply_static_encoder_properties(
     set_component_property_int64(component, HEVC_QUERY_TIMEOUT_PROPERTY, 0)?;
     set_component_property_bool(component, HEVC_LOW_LATENCY_MODE_PROPERTY, true)?;
     set_component_property_bool(component, HEVC_INPUT_FULL_RANGE_PROPERTY, true)?;
+    set_component_property_size(
+        component,
+        HEVC_FRAMESIZE_PROPERTY,
+        sys::AMFSize {
+            width: width.min(i32::MAX as u32) as i32,
+            height: height.min(i32::MAX as u32) as i32,
+        },
+    )?;
     Ok(())
 }
 
@@ -681,8 +701,10 @@ fn set_component_property_size(
         unsafe { ((*(*component).pVtbl).SetProperty)(component, property_name.as_ptr(), variant) };
     if status != sys::AMF_OK {
         return Err(EncodeError::InitFailed(format!(
-            "AMF SetProperty({name}) failed with {}",
-            format_amf_status(status)
+            "AMF SetProperty({name}={}x{}) failed with {}",
+            value.width,
+            value.height,
+            format_amf_status(status),
         )));
     }
     Ok(())
@@ -960,13 +982,33 @@ fn format_amf_status(status: sys::AMF_RESULT) -> String {
     let label = match status {
         sys::AMF_OK => "AMF_OK",
         sys::AMF_FAIL => "AMF_FAIL",
+        sys::AMF_UNEXPECTED => "AMF_UNEXPECTED",
+        sys::AMF_ACCESS_DENIED => "AMF_ACCESS_DENIED",
+        sys::AMF_INVALID_ARG => "AMF_INVALID_ARG",
+        sys::AMF_OUT_OF_RANGE => "AMF_OUT_OF_RANGE",
+        sys::AMF_OUT_OF_MEMORY => "AMF_OUT_OF_MEMORY",
+        sys::AMF_INVALID_POINTER => "AMF_INVALID_POINTER",
+        sys::AMF_NO_INTERFACE => "AMF_NO_INTERFACE",
+        sys::AMF_NOT_IMPLEMENTED => "AMF_NOT_IMPLEMENTED",
         sys::AMF_ALREADY_INITIALIZED => "AMF_ALREADY_INITIALIZED",
+        sys::AMF_NOT_INITIALIZED => "AMF_NOT_INITIALIZED",
+        sys::AMF_INVALID_FORMAT => "AMF_INVALID_FORMAT",
+        sys::AMF_WRONG_STATE => "AMF_WRONG_STATE",
+        sys::AMF_FILE_NOT_OPEN => "AMF_FILE_NOT_OPEN",
+        sys::AMF_NO_DEVICE => "AMF_NO_DEVICE",
         sys::AMF_INPUT_FULL => "AMF_INPUT_FULL",
         sys::AMF_REPEAT => "AMF_REPEAT",
         sys::AMF_NEED_MORE_INPUT => "AMF_NEED_MORE_INPUT",
         sys::AMF_EOF => "AMF_EOF",
         sys::AMF_NOT_SUPPORTED => "AMF_NOT_SUPPORTED",
+        sys::AMF_NOT_FOUND => "AMF_NOT_FOUND",
+        sys::AMF_INVALID_DATA_TYPE => "AMF_INVALID_DATA_TYPE",
+        sys::AMF_INVALID_RESOLUTION => "AMF_INVALID_RESOLUTION",
         sys::AMF_CODEC_NOT_SUPPORTED => "AMF_CODEC_NOT_SUPPORTED",
+        sys::AMF_SURFACE_FORMAT_NOT_SUPPORTED => "AMF_SURFACE_FORMAT_NOT_SUPPORTED",
+        sys::AMF_SURFACE_MUST_BE_SHARED => "AMF_SURFACE_MUST_BE_SHARED",
+        sys::AMF_DECODER_NOT_PRESENT => "AMF_DECODER_NOT_PRESENT",
+        sys::AMF_DECODER_NO_FREE_SURFACES => "AMF_DECODER_NO_FREE_SURFACES",
         sys::AMF_ENCODER_NOT_PRESENT => "AMF_ENCODER_NOT_PRESENT",
         sys::AMF_VULKAN_FAILED => "AMF_VULKAN_FAILED",
         sys::AMF_DIRECTX_FAILED => "AMF_DIRECTX_FAILED",
@@ -1094,12 +1136,32 @@ mod sys {
 
     pub const AMF_OK: AMF_RESULT = 0;
     pub const AMF_FAIL: AMF_RESULT = 1;
+    pub const AMF_UNEXPECTED: AMF_RESULT = 2;
+    pub const AMF_ACCESS_DENIED: AMF_RESULT = 3;
+    pub const AMF_INVALID_ARG: AMF_RESULT = 4;
+    pub const AMF_OUT_OF_RANGE: AMF_RESULT = 5;
+    pub const AMF_OUT_OF_MEMORY: AMF_RESULT = 6;
+    pub const AMF_INVALID_POINTER: AMF_RESULT = 7;
+    pub const AMF_NO_INTERFACE: AMF_RESULT = 8;
+    pub const AMF_NOT_IMPLEMENTED: AMF_RESULT = 9;
     pub const AMF_NOT_SUPPORTED: AMF_RESULT = 10;
+    pub const AMF_NOT_FOUND: AMF_RESULT = 11;
     pub const AMF_ALREADY_INITIALIZED: AMF_RESULT = 12;
+    pub const AMF_NOT_INITIALIZED: AMF_RESULT = 13;
+    pub const AMF_INVALID_FORMAT: AMF_RESULT = 14;
+    pub const AMF_WRONG_STATE: AMF_RESULT = 15;
+    pub const AMF_FILE_NOT_OPEN: AMF_RESULT = 16;
+    pub const AMF_NO_DEVICE: AMF_RESULT = 17;
     pub const AMF_EOF: AMF_RESULT = 23;
     pub const AMF_REPEAT: AMF_RESULT = 24;
     pub const AMF_INPUT_FULL: AMF_RESULT = 25;
+    pub const AMF_INVALID_DATA_TYPE: AMF_RESULT = 28;
+    pub const AMF_INVALID_RESOLUTION: AMF_RESULT = 29;
     pub const AMF_CODEC_NOT_SUPPORTED: AMF_RESULT = 30;
+    pub const AMF_SURFACE_FORMAT_NOT_SUPPORTED: AMF_RESULT = 31;
+    pub const AMF_SURFACE_MUST_BE_SHARED: AMF_RESULT = 32;
+    pub const AMF_DECODER_NOT_PRESENT: AMF_RESULT = 33;
+    pub const AMF_DECODER_NO_FREE_SURFACES: AMF_RESULT = 35;
     pub const AMF_ENCODER_NOT_PRESENT: AMF_RESULT = 36;
     pub const AMF_NEED_MORE_INPUT: AMF_RESULT = 44;
     pub const AMF_VULKAN_FAILED: AMF_RESULT = 45;

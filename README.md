@@ -47,8 +47,6 @@ cargo run -p ustreamer-demo --features amf-direct
 cargo run -p ustreamer-demo --features nvenc-direct,amf-direct
 ```
 
-The AMD path has no extra SDK dependency at build time: no GStreamer and no separate AMD development package. `ustreamer-encode` loads `amfrt64.dll` on Windows or `libamfrt64.so.1` on Linux from the installed AMD driver at runtime.
-
 Then open `http://127.0.0.1:8090/` in Chrome/Chromium.
 
 The demo auto-detects your GPU and selects the best encoder. Build with `nvenc-direct,amf-direct` when you want one Windows/Linux binary that can choose NVIDIA or AMD at startup. Override with `--codec hevc|av1` or `--nvenc-device <n>` if needed.
