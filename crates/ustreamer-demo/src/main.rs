@@ -35,7 +35,7 @@ mod demo {
     #[cfg(any(
         target_os = "macos",
         all(
-            feature = "gstreamer-fallback",
+            feature = "amf-direct",
             any(target_os = "linux", target_os = "windows")
         )
     ))]
@@ -47,12 +47,10 @@ mod demo {
     use ustreamer_capture::{VulkanCaptureSyncMode, VulkanExternalCapture};
     use ustreamer_encode::FrameEncoder;
     #[cfg(all(
-        feature = "gstreamer-fallback",
+        feature = "amf-direct",
         any(target_os = "linux", target_os = "windows")
     ))]
-    use ustreamer_encode::gstreamer::{
-        GStreamerBackend, GStreamerCodec, GStreamerEncoder, GStreamerPipelinePlan,
-    };
+    use ustreamer_encode::amf::AmfEncoder;
     #[cfg(all(
         feature = "nvenc-direct",
         any(target_os = "linux", target_os = "windows")
@@ -66,11 +64,6 @@ mod demo {
     };
     use ustreamer_proto::frame::{FramePacket, packetize_frame};
     use ustreamer_proto::input::InputEvent;
-    #[cfg(all(
-        feature = "gstreamer-fallback",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    use ustreamer_proto::quality::EncodeParams;
     use ustreamer_proto::quality::QualityTier;
     use ustreamer_quality::{QualityConfig, QualityController};
     use ustreamer_transport::{WebSocketServer, WebSocketSession};
@@ -193,23 +186,6 @@ mod demo {
             }
         }
 
-        #[cfg(any(
-            all(
-                feature = "nvenc-direct",
-                any(target_os = "linux", target_os = "windows")
-            ),
-            all(
-                feature = "gstreamer-fallback",
-                any(target_os = "linux", target_os = "windows")
-            )
-        ))]
-        fn display_name(self) -> &'static str {
-            match self {
-                Self::Hevc => "HEVC",
-                Self::Av1 => "AV1",
-            }
-        }
-
         #[cfg(all(
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
@@ -244,10 +220,10 @@ mod demo {
         #[cfg(target_os = "macos")]
         VideoToolbox,
         #[cfg(all(
-            feature = "gstreamer-fallback",
+            feature = "amf-direct",
             any(target_os = "linux", target_os = "windows")
         ))]
-        GstreamerFallback { backend: GStreamerBackend },
+        AmfDirect,
         #[cfg(all(
             feature = "nvenc-direct",
             any(target_os = "linux", target_os = "windows")
@@ -299,7 +275,7 @@ mod demo {
                     }
                     "--help" | "-h" => {
                         anyhow::bail!(
-                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct,gstreamer-fallback] [-- --nvenc-device <ordinal> --codec <hevc|av1>]"
+                            "Usage: cargo run -p ustreamer-demo [--features nvenc-direct,amf-direct] [-- --nvenc-device <ordinal> --codec <hevc|av1>]"
                         );
                     }
                     other => {
@@ -335,23 +311,23 @@ mod demo {
             let detected_hardware = graphics_probe
                 .map(|probe| probe.describe())
                 .unwrap_or_else(|| format!("{} host", env::consts::OS));
-            #[cfg(any(feature = "nvenc-direct", feature = "gstreamer-fallback"))]
+            #[cfg(any(feature = "nvenc-direct", feature = "amf-direct"))]
             let mut errors: Vec<String> = Vec::new();
-            #[cfg(not(any(feature = "nvenc-direct", feature = "gstreamer-fallback")))]
+            #[cfg(not(any(feature = "nvenc-direct", feature = "amf-direct")))]
             let errors: Vec<String> = Vec::new();
 
             match detected_vendor {
                 DemoGpuVendor::Amd => {
-                    #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(_options, graphics_probe) {
+                    #[cfg(feature = "amf-direct")]
+                    match try_select_amf_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
-                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                        Err(error) => errors.push(format!("AMF: {error:#}")),
                     }
                     #[cfg(feature = "nvenc-direct")]
                     match try_select_nvenc_backend(_options, graphics_probe) {
                         Ok(backend) => {
                             warn!(
-                                "Detected AMD hardware ({detected_hardware}) but the GStreamer fallback path was unavailable. Using NVENC path instead."
+                                "Detected AMD hardware ({detected_hardware}) but the direct AMF path was unavailable. Using NVENC path instead."
                             );
                             return Ok(backend);
                         }
@@ -364,15 +340,15 @@ mod demo {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("NVENC: {error:#}")),
                     }
-                    #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(_options, graphics_probe) {
+                    #[cfg(feature = "amf-direct")]
+                    match try_select_amf_backend(_options, graphics_probe) {
                         Ok(backend) => {
                             warn!(
-                                "Detected NVIDIA hardware ({detected_hardware}) but the direct NVENC path was unavailable. Falling back to GStreamer."
+                                "Detected NVIDIA hardware ({detected_hardware}) but the direct NVENC path was unavailable. Falling back to AMF."
                             );
                             return Ok(backend);
                         }
-                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                        Err(error) => errors.push(format!("AMF: {error:#}")),
                     }
                 }
                 DemoGpuVendor::Unknown => {
@@ -381,17 +357,17 @@ mod demo {
                         Ok(backend) => return Ok(backend),
                         Err(error) => errors.push(format!("NVENC: {error:#}")),
                     }
-                    #[cfg(feature = "gstreamer-fallback")]
-                    match try_select_gstreamer_backend(_options, graphics_probe) {
+                    #[cfg(feature = "amf-direct")]
+                    match try_select_amf_backend(_options, graphics_probe) {
                         Ok(backend) => return Ok(backend),
-                        Err(error) => errors.push(format!("GStreamer fallback: {error:#}")),
+                        Err(error) => errors.push(format!("AMF: {error:#}")),
                     }
                 }
             }
 
             if errors.is_empty() {
                 anyhow::bail!(
-                    "ustreamer-demo on {} requires either the `nvenc-direct` or `gstreamer-fallback` feature; run `cargo run -p ustreamer-demo --features gstreamer-fallback -- --codec hevc` for AMD/other GPUs or enable `nvenc-direct` for NVIDIA",
+                    "ustreamer-demo on {} requires either the `nvenc-direct` or `amf-direct` feature; run `cargo run -p ustreamer-demo --features amf-direct -- --codec hevc` for AMD/other GPUs or enable `nvenc-direct` for NVIDIA",
                     env::consts::OS,
                 );
             }
@@ -407,15 +383,10 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => "VideoToolbox HEVC + staging capture".into(),
                 #[cfg(all(
-                    feature = "gstreamer-fallback",
+                    feature = "amf-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::GstreamerFallback { backend } => {
-                    format!(
-                        "GStreamer {} fallback + staging capture",
-                        backend.display_name()
-                    )
-                }
+                Self::AmfDirect => "direct AMF HEVC + staging capture".into(),
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -432,10 +403,10 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => wgpu::Backends::PRIMARY,
                 #[cfg(all(
-                    feature = "gstreamer-fallback",
+                    feature = "amf-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::GstreamerFallback { .. } => wgpu::Backends::PRIMARY,
+                Self::AmfDirect => wgpu::Backends::PRIMARY,
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -457,10 +428,10 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Box::new(StagingCapture::new(3)),
                 #[cfg(all(
-                    feature = "gstreamer-fallback",
+                    feature = "amf-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::GstreamerFallback { .. } => Box::new(StagingCapture::new(3)),
+                Self::AmfDirect => Box::new(StagingCapture::new(3)),
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -480,16 +451,13 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Ok(Box::new(VideoToolboxEncoder::new())),
                 #[cfg(all(
-                    feature = "gstreamer-fallback",
+                    feature = "amf-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::GstreamerFallback { backend } => GStreamerEncoder::new()
+                Self::AmfDirect => AmfEncoder::new()
                     .map(|encoder| Box::new(encoder) as Box<dyn FrameEncoder>)
                     .map_err(|error| {
-                        anyhow!(
-                            "failed to create {} GStreamer fallback encoder: {error}",
-                            backend.display_name()
-                        )
+                        anyhow!("failed to create direct AMF HEVC encoder: {error}")
                     }),
                 #[cfg(all(feature = "nvenc-direct", any(target_os = "linux", target_os = "windows")))]
                 Self::NvencDirect { cuda_device, codec } => NvencEncoder::with_config_and_cuda_device(
@@ -514,10 +482,10 @@ mod demo {
                 #[cfg(target_os = "macos")]
                 Self::VideoToolbox => Ok(DemoCaptureMode::Standard),
                 #[cfg(all(
-                    feature = "gstreamer-fallback",
+                    feature = "amf-direct",
                     any(target_os = "linux", target_os = "windows")
                 ))]
-                Self::GstreamerFallback { .. } => Ok(DemoCaptureMode::Standard),
+                Self::AmfDirect => Ok(DemoCaptureMode::Standard),
                 #[cfg(all(
                     feature = "nvenc-direct",
                     any(target_os = "linux", target_os = "windows")
@@ -540,34 +508,33 @@ mod demo {
     }
 
     #[cfg(all(
-        feature = "gstreamer-fallback",
+        feature = "amf-direct",
         any(target_os = "linux", target_os = "windows")
     ))]
-    fn try_select_gstreamer_backend(
+    fn try_select_amf_backend(
         options: DemoOptions,
         graphics_probe: Option<&DemoGraphicsProbe>,
     ) -> Result<DemoBackend> {
         if options.codec_override == Some(DemoCodec::Av1) {
             anyhow::bail!(
-                "ustreamer-demo GStreamer fallback currently supports `--codec hevc` only; AV1 remains direct-NVENC only"
+                "ustreamer-demo direct AMF currently supports `--codec hevc` only; AV1 remains direct-NVENC only"
             );
         }
 
-        let probe_params = EncodeParams::default();
-        let plan = GStreamerPipelinePlan::probe_default(GStreamerCodec::Hevc, &probe_params)
-            .map_err(|error| anyhow!("failed to probe GStreamer fallback runtime: {error}"))?;
+        let capabilities = AmfEncoder::probe()
+            .map_err(|error| anyhow!("failed to probe direct AMF runtime: {error}"))?;
         let detected_hardware = graphics_probe
             .map(|probe| format!(" for {}", probe.describe()))
             .unwrap_or_default();
         info!(
-            "Auto-selected GStreamer fallback backend {} using encoder `{}`{}.",
-            plan.backend.display_name(),
-            plan.encoder_element,
+            "Auto-selected direct AMF backend using {} (runtime version {}.{}.{}){}.",
+            capabilities.runtime_library,
+            capabilities.runtime_version >> 48,
+            (capabilities.runtime_version >> 32) & 0xffff,
+            (capabilities.runtime_version >> 16) & 0xffff,
             detected_hardware
         );
-        Ok(DemoBackend::GstreamerFallback {
-            backend: plan.backend,
-        })
+        Ok(DemoBackend::AmfDirect)
     }
 
     #[cfg(all(

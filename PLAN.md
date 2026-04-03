@@ -44,9 +44,9 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 - **Implemented:** new `ustreamer-app` crate now defines the initial public integration contract for external apps — documented traits/helpers for frame sourcing, mapped/raw input sinks, loopback bootstrap endpoints, and optional session lifecycle hooks — and `ustreamer-demo` now uses those helpers instead of bespoke local glue
 - **Implemented:** the browser demo now renders its per-client crosshair plus mode/reset controls as native HTML overlay instead of baking those pixels into the streamed shader output, which is the first concrete slice of the hybrid overlay roadmap
 - **Implemented:** workspace/package polish for crates.io is now in place: internal workspace dependencies carry publishable versions, shared manifest metadata is inherited from the workspace, the local NVENC binding crate is routed through a `[patch.crates-io]` override, the publishable crates point at shared docs.rs/readme metadata, the demo/probe binaries are marked `publish = false`, and a staged release helper script now codifies the crates.io publish order
-- **Implemented:** `ustreamer-encode` now exposes a feature-gated GStreamer fallback HEVC backend for AMD/unsupported GPUs: backend selection for Windows AMF vs Linux VA-API, `gst-inspect-1.0` runtime/plugin probing, a staged `CapturedFrame::CpuBuffer` -> `appsrc` path, AU-aligned `appsink` output normalized for WebCodecs, browser decoder-config derivation from the first keyframe, and `ustreamer-demo` integration behind `--features gstreamer-fallback`
-- **Implemented:** the Windows/Linux demo now auto-detects the preferred high-performance GPU vendor before choosing an encoder path: NVIDIA hosts still prefer direct NVENC, while AMD/Radeon hosts prefer the GStreamer fallback path, and the Linux GStreamer probe now auto-selects `vah265enc` before falling back to `vaapih265enc`
-- **Next up:** validate the new GStreamer fallback on real Linux/Windows plugin stacks, expand AV1 runtime validation on AV1-capable hardware, and then execute the staged crates.io publish when desired
+- **Implemented:** `ustreamer-encode` now exposes a feature-gated direct AMF HEVC backend for AMD/unsupported GPUs: runtime loading from the installed driver (`amfrt64.dll` on Windows, `libamfrt64.so.1` on Linux), staged `CapturedFrame::CpuBuffer` input, AMF HEVC output normalized for WebCodecs, and browser decoder-config derivation from the first keyframe — without any GStreamer build dependency
+- **Implemented:** the Windows/Linux demo now auto-detects the preferred high-performance GPU vendor before choosing an encoder path: NVIDIA hosts still prefer direct NVENC, while AMD/Radeon hosts prefer the direct AMF path
+- **Next up:** validate the new direct AMF backend on real Windows/Linux AMD systems, expand AV1 runtime validation on AV1-capable hardware, and then execute the staged crates.io publish when desired
 
 ---
 
@@ -61,7 +61,7 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 │  │  (your app    │   │ (zero-copy via   │   │ ┌─────────────────────┐ │   │
 │  │  renderer)   │   │  wgpu-hal native │   │ │ Apple: VideoToolbox │ │   │
 │  └─────────────┘   │  texture interop) │   │ │ NVIDIA: NVENC       │ │   │
-│                     └──────────────────┘   │ │ (AMD: AMF/VA-API)   │ │   │
+│                     └──────────────────┘   │ │ AMD: AMF           │ │   │
 │                                            │ └─────────────────────┘ │   │
 │                                            └────────┬────────────────┘   │
 │                                                     │ H.265/AV1 NALUs  │
@@ -103,12 +103,12 @@ Stream any native Rust/wgpu application to a web browser over **internal LAN** w
 |----------|----------|-----------|-----|---------------|----------------------|
 | **P0** | **Apple M4** | Apple Media Engine | VideoToolbox | H.264, H.265, AV1 | Direct `objc2` FFI to `VTCompressionSession` + IOSurface zero-copy |
 | **P0** | **NVIDIA RTX 30/40/50** | NVENC (dedicated ASIC) | Video Codec SDK | H.264, H.265, AV1 | `nvidia-video-codec-rs` with CUDA texture interop |
-| **P1** | **AMD RDNA3+** (nice-to-have) | VCN 4.0 | AMF/VA-API | H.264, H.265, AV1 | `gstreamer-rs` with `amfenc`/`vaapi` plugin |
+| **P1** | **AMD RDNA3+** (nice-to-have) | VCN 4.0 | AMF | H.264, H.265, AV1 | Direct AMF runtime loading + Rust FFI |
 | **Future** | **Cross-vendor** | Vulkan Video Encode | `VK_KHR_video_encode_queue` | H.264, H.265 | `ash` crate — when mature, unifies NVIDIA+AMD |
 
 ### 2.2 Recommended Encoding Strategy: Direct APIs First
 
-Since we're optimizing for absolute best latency, **skip GStreamer** as the primary path. Go direct to each platform's native encoder API to eliminate middleware overhead:
+Since we're optimizing for absolute best latency, go direct to each platform's native encoder API to eliminate middleware overhead:
 
 ```
 ┌───────────────────────────────────────────────────┐
@@ -131,19 +131,19 @@ Since we're optimizing for absolute best latency, **skip GStreamer** as the prim
 │  │  IOSurface input)  │  │  codec-rs, CUDA)   │    │
 │  └───────────────────┘  └────────────────────┘    │
 │           ┌────────────────────────┐               │
-│           │ GStreamer (fallback,   │               │
-│           │  AMD + other GPUs)    │               │
+│           │ AMD AMF (direct,      │               │
+│           │  runtime-loaded)      │               │
 │           └────────────────────────┘               │
 └───────────────────────────────────────────────────┘
 ```
 
-**Why direct over GStreamer for P0:**
+**Why direct APIs first:**
 - Eliminates ~0.5–2ms per frame of pipeline overhead
 - Direct control over encoder hardware queues and synchronization
 - True zero-copy from wgpu render texture → encoder input
 - Precise control over lossless mode toggling per-frame
 
-**GStreamer retained as P1 fallback** for AMD and any future GPU vendors.
+**Direct AMF is the current P1 AMD path**, with Vulkan Video still the longer-term cross-vendor direction.
 
 ### 2.3 Codec Selection — LAN-Optimized
 
@@ -689,14 +689,14 @@ AV1 (RTX 40+):
   Dual AV1 encoders on Ada → can encode two streams simultaneously
 ```
 
-### 10.3 AMD RDNA3+ (AMF/VA-API) — P1 Nice-to-Have
+### 10.3 AMD RDNA3+ (AMF) — Current P1 Path
 
 ```
-Encoder: GStreamer with amfh265enc (Windows) or vaapih265enc (Linux)
+Encoder: Direct AMD AMF HEVC backend
 Codec: H.265 Main, AV1 on RDNA3+
-Input: Via GStreamer appsrc (staging buffer path, not zero-copy initially)
+Input: CPU staging path first, zero-copy interop later
 Settings: Similar bitrate/quality targets as above
-Note: Lower priority — implement after Mac + NVIDIA are solid
+Status: Implemented behind `amf-direct`; remaining work is runtime validation and tuning on real AMD hardware
 ```
 
 ---
@@ -720,11 +720,11 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **adaptive-quality** *(done)*: Monitor QUIC RTT + loss → cap bitrate/resolution tier with downgrade/upgrade hysteresis, adjust framerate on idle
 - **browser-overlay-hybrid**: the browser client now renders the demo crosshair plus mode/reset controls as native overlay, proving the per-client hybrid-overlay model and removing those cursor/tool pixels from the encoded stream. Remaining work is moving richer metadata/annotations and app-specific toolbars into the same browser-native layer
 
-### Phase 3: Polish + AMD Fallback
+### Phase 3: Polish + AMD
 
 - **integration-ergonomics** *(done)*: `ustreamer-app` now provides the first explicit public integration contract for external apps — documented traits/helpers for frame sourcing, input sinks, lifecycle hooks, and bootstrap wiring — and the demo has been refactored to exercise that surface
 - **demo-auto-detect** *(done)*: the demo now auto-selects the best available backend/codec/sync mode for the current host — currently VideoToolbox HEVC on macOS and NVENC AV1→HEVC fallback for the selected/default CUDA device plus timeline→host-sync fallback for the active Vulkan capture device on Windows/Linux — while preserving explicit CLI overrides for testing and bring-up
-- **encoder-gstreamer-fallback**: a first feature-gated fallback HEVC backend now exists in `ustreamer-encode` for AMD/unsupported GPU hosts — staged `CapturedFrame::CpuBuffer` input, GStreamer runtime/plugin probing, low-latency appsrc/appsink pipeline execution, HEVC AU normalization + decoder-config extraction for the existing browser path, and demo integration behind `gstreamer-fallback`. Remaining work is real Linux/Windows hardware/plugin validation plus any backend-specific tuning discovered there
+- **encoder-amf-direct** *(implemented, pending hardware validation)*: a feature-gated direct AMF HEVC backend now exists in `ustreamer-encode` for AMD/unsupported GPU hosts — staged `CapturedFrame::CpuBuffer` input, runtime loading from the installed AMD driver, HEVC AU normalization + decoder-config extraction for the existing browser path, and demo integration behind `amf-direct`. Remaining work is real Linux/Windows hardware validation plus any backend-specific tuning discovered there
 - **publish-readiness** *(done)*: workspace manifests now inherit shared license/repository/homepage metadata, internal workspace dependencies carry publishable versions, the vendored NVENC binding crate is redirected through a local `[patch.crates-io]`, the publishable crates now carry docs.rs/readme/keyword metadata, `ustreamer-demo` / `ustreamer-nvenc-probe` are marked `publish = false`, stage-1 crates pass `cargo publish --dry-run`, the later stages have explicit dependency blockers only, and `scripts/publish-crates.sh` now codifies the staged release order
 - **capture-staging-fallback** *(done)*: Triple-buffered copy_texture_to_buffer for platforms without zero-copy interop
 - **transport-ws-fallback** *(done)*: WebSocket fallback transport for non-Chrome browsers (same WebCodecs decode)
@@ -761,5 +761,4 @@ Note: Lower priority — implement after Mac + NVIDIA are solid
 - **Sunshine** (C++): Most mature game streaming server, multi-GPU encode ([GitHub](https://github.com/LizardByte/Sunshine))
 - **Selkies-GStreamer**: GStreamer + WebRTC for cloud Linux desktops ([GitHub](https://github.com/selkies-project/selkies-gstreamer))
 - **webrtc-rs**: Pure Rust WebRTC stack ([GitHub](https://github.com/webrtc-rs/webrtc))
-- **gstreamer-rs**: GStreamer Rust bindings ([GitHub](https://github.com/sdroege/gstreamer-rs))
 - **nvidia-video-codec-rs**: NVENC/NVDEC Rust bindings ([GitHub](https://github.com/rust-av/nvidia-video-codec-rs))

@@ -12,7 +12,7 @@ Capture GPU frames from your `wgpu` render loop, encode with platform-native har
 |---|---|---|
 | **Apple Silicon** (M1+) | VideoToolbox HEVC | Metal IOSurface zero-copy |
 | **NVIDIA** (RTX 20+) | NVENC HEVC/AV1 | Vulkan external memory → CUDA |
-| **AMD** (RDNA2+) | GStreamer AMF/VA-API HEVC | CPU staging fallback |
+| **AMD** (RDNA2+) | AMF HEVC | CPU staging fallback |
 
 ## Workspace
 
@@ -20,7 +20,7 @@ Capture GPU frames from your `wgpu` render loop, encode with platform-native har
 crates/
 ├── ustreamer-proto      # Wire protocol types
 ├── ustreamer-capture    # GPU frame capture
-├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, GStreamer)
+├── ustreamer-encode     # HW video encoding (VideoToolbox, NVENC, AMF)
 ├── ustreamer-transport  # WebTransport + WebSocket server
 ├── ustreamer-input      # Browser input mapping
 ├── ustreamer-quality    # Adaptive quality controller
@@ -40,25 +40,18 @@ cargo run -p ustreamer-demo
 # NVIDIA (direct NVENC)
 cargo run -p ustreamer-demo --features nvenc-direct
 
-# AMD / GStreamer fallback
-cargo run -p ustreamer-demo --features gstreamer-fallback
+# AMD (direct AMF)
+cargo run -p ustreamer-demo --features amf-direct
 
 # Auto-detect GPU vendor (recommended for mixed hardware)
-cargo run -p ustreamer-demo --features nvenc-direct,gstreamer-fallback
+cargo run -p ustreamer-demo --features nvenc-direct,amf-direct
 ```
 
-On **Windows/MSVC**, `gstreamer-fallback` also needs the native **GStreamer development** install at build time, not just the runtime. Install both the official `gstreamer-1.0-msvc-x86_64-*.msi` runtime and `gstreamer-1.0-devel-msvc-x86_64-*.msi` development package, then make sure `C:\gstreamer\1.0\msvc_x86_64\bin` is on `PATH` so both `pkg-config.exe` and `gst-inspect-1.0.exe` are visible to Cargo. If you installed GStreamer somewhere else, point `PKG_CONFIG_PATH` at that tree's `lib\pkgconfig` directory. A quick sanity check before `cargo run` is:
-
-```powershell
-pkg-config --cflags --libs gstreamer-1.0 gstreamer-app-1.0 gstreamer-base-1.0
-gst-inspect-1.0 amfh265enc
-```
-
-Use the **MSVC** Rust toolchain with the **MSVC** GStreamer binaries; do not mix MinGW/MSYS2 GStreamer packages into the same build.
+The AMD path has no extra SDK dependency at build time: no GStreamer and no separate AMD development package. `ustreamer-encode` loads `amfrt64.dll` on Windows or `libamfrt64.so.1` on Linux from the installed AMD driver at runtime.
 
 Then open `http://127.0.0.1:8090/` in Chrome/Chromium.
 
-The demo auto-detects your GPU and selects the best encoder. Override with `--codec hevc|av1` or `--nvenc-device <n>` if needed.
+The demo auto-detects your GPU and selects the best encoder. Build with `nvenc-direct,amf-direct` when you want one Windows/Linux binary that can choose NVIDIA or AMD at startup. Override with `--codec hevc|av1` or `--nvenc-device <n>` if needed.
 
 ## Building
 

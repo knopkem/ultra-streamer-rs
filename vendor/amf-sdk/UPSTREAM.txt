@@ -1,0 +1,7 @@
+GPUOpen AMF SDK reference
+Repository: https://github.com/GPUOpen-LibrariesAndSDKs/AMF
+Commit: d0b3e6dd544a5f207bb6a12a1ecb98532491176a
+
+The direct AMF Rust backend in `crates/ustreamer-encode/src/amf.rs` uses
+hand-written FFI definitions and property constants derived from the upstream
+MIT-licensed AMF SDK headers.

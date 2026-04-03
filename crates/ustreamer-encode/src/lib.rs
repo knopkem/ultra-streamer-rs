@@ -3,11 +3,16 @@
 //! Provides a trait [`FrameEncoder`] with platform-specific implementations:
 //! - **VideoToolbox** (macOS): H.265 Main10 via `VTCompressionSession`
 //! - **NVENC** (NVIDIA): H.265/AV1 via NVIDIA Video Codec SDK
-//! - **GStreamer fallback**: feature-gated staged-BGRA HEVC encode for
-//!   Linux/Windows fallback paths via `appsrc`/`appsink`
-#[cfg(feature = "gstreamer-fallback")]
-pub mod gstreamer;
-#[cfg(feature = "gstreamer-fallback")]
+//! - **AMF** (AMD): feature-gated staged-BGRA HEVC encode via the AMD driver runtime
+#[cfg(all(
+    feature = "amf-direct",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub mod amf;
+#[cfg(all(
+    feature = "amf-direct",
+    any(target_os = "linux", target_os = "windows")
+))]
 mod hevc;
 
 #[cfg(all(
