@@ -280,8 +280,7 @@ impl AmfSession {
         if is_first_frame {
             info!("AMF first frame: assigning timing metadata.");
         }
-        let input_data = query_surface_data(surface.as_ptr())?;
-        set_data_timing(input_data.as_ptr(), frame_index, params.target_fps.max(1));
+        set_surface_pts(surface.as_ptr(), frame_index, params.target_fps.max(1));
         if params.force_keyframe {
             set_surface_property_int64(
                 surface.as_ptr(),
@@ -298,7 +297,10 @@ impl AmfSession {
         if is_first_frame {
             info!("AMF first frame: submitting input to encoder.");
         }
-        submit_input(self.component.as_ptr(), input_data.as_ptr())?;
+        submit_input(
+            self.component.as_ptr(),
+            surface.as_ptr() as *mut sys::AMFData,
+        )?;
         if is_first_frame {
             info!("AMF first frame: SubmitInput returned successfully.");
         }
@@ -638,7 +640,13 @@ fn copy_cpu_frame_into_surface(
     width: u32,
     height: u32,
 ) -> Result<(), EncodeError> {
-    let plane = unsafe { ((*(*surface).pVtbl).GetPlane)(surface, sys::AMF_PLANE_PACKED) };
+    let plane_count = unsafe { ((*(*surface).pVtbl).GetPlanesCount)(surface) };
+    if plane_count == 0 {
+        return Err(EncodeError::EncodeFailed(
+            "AMF BGRA surface reported zero planes".into(),
+        ));
+    }
+    let plane = unsafe { ((*(*surface).pVtbl).GetPlaneAt)(surface, 0) };
     let plane = PlaneHandle::from_raw(plane)?;
     let destination = unsafe { ((*(*plane.as_ptr()).pVtbl).GetNative)(plane.as_ptr()) } as *mut u8;
     if destination.is_null() {
@@ -678,13 +686,11 @@ fn copy_cpu_frame_into_surface(
     Ok(())
 }
 
-fn set_data_timing(data: *mut sys::AMFData, frame_index: u64, target_fps: u32) {
+fn set_surface_pts(surface: *mut sys::AMFSurface, frame_index: u64, target_fps: u32) {
     let fps = u64::from(target_fps.max(1));
     let pts = frame_index.saturating_mul(sys::AMF_SECOND) / fps;
-    let duration = (sys::AMF_SECOND / fps).max(1);
     unsafe {
-        ((*(*data).pVtbl).SetPts)(data, pts as i64);
-        ((*(*data).pVtbl).SetDuration)(data, duration as i64);
+        ((*(*surface).pVtbl).SetPts)(surface, pts as i64);
     }
 }
 
@@ -733,31 +739,6 @@ fn query_output_buffer(data: *mut sys::AMFData) -> Result<BufferHandle, EncodeEr
         )));
     }
     BufferHandle::from_raw(interface.cast())
-}
-
-fn query_surface_data(surface: *mut sys::AMFSurface) -> Result<DataHandle, EncodeError> {
-    let mut interface: *mut c_void = ptr::null_mut();
-    let status = unsafe {
-        ((*(*surface).pVtbl).QueryInterface)(
-            surface,
-            &sys::AMF_DATA_IID,
-            &mut interface as *mut _ as *mut *mut c_void,
-        )
-    };
-    if status != sys::AMF_OK {
-        return Err(EncodeError::EncodeFailed(format!(
-            "AMFSurface::QueryInterface(AMFData) failed with {}",
-            format_amf_status(status)
-        )));
-    }
-    let data = DataHandle::from_raw(interface.cast())?;
-    let data_type = unsafe { ((*(*data.as_ptr()).pVtbl).GetDataType)(data.as_ptr()) };
-    if data_type != sys::AMF_DATA_SURFACE {
-        return Err(EncodeError::EncodeFailed(format!(
-            "AMF surface QueryInterface(AMFData) returned unexpected data type {data_type}"
-        )));
-    }
-    Ok(data)
 }
 
 fn read_buffer_bytes(buffer: *mut sys::AMFBuffer) -> Result<Vec<u8>, EncodeError> {
@@ -1291,9 +1272,7 @@ mod sys {
     pub const AMF_DX11_0: AMF_DX_VERSION = 110;
     pub const AMF_DX11_1: AMF_DX_VERSION = 111;
     pub const AMF_DATA_BUFFER: AMF_DATA_TYPE = 0;
-    pub const AMF_DATA_SURFACE: AMF_DATA_TYPE = 1;
     pub const AMF_SURFACE_BGRA: AMF_SURFACE_FORMAT = 3;
-    pub const AMF_PLANE_PACKED: AMF_PLANE_TYPE = 1;
 
     pub const AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY_HIGH_QUALITY: i32 = 5;
     pub const AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR: i32 = 3;
@@ -1346,20 +1325,6 @@ mod sys {
         data46: 0xc6,
         data47: 0x86,
         data48: 0x46,
-    };
-
-    pub const AMF_DATA_IID: AMFGuid = AMFGuid {
-        data1: 0xa1159bf6,
-        data2: 0x9104,
-        data3: 0x4107,
-        data41: 0x8e,
-        data42: 0xaa,
-        data43: 0xc5,
-        data44: 0x3d,
-        data45: 0x5d,
-        data46: 0xba,
-        data47: 0xc5,
-        data48: 0x11,
     };
 
     pub const AMF_BUFFER_IID: AMFGuid = AMFGuid {
