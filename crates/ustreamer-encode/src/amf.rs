@@ -279,7 +279,8 @@ impl AmfSession {
         if is_first_frame {
             info!("AMF first frame: assigning timing metadata.");
         }
-        set_surface_timing(surface.as_ptr(), frame_index, params.target_fps.max(1))?;
+        let input_data = query_surface_data(surface.as_ptr())?;
+        set_data_timing(input_data.as_ptr(), frame_index, params.target_fps.max(1));
         if params.force_keyframe {
             set_surface_property_int64(
                 surface.as_ptr(),
@@ -296,10 +297,7 @@ impl AmfSession {
         if is_first_frame {
             info!("AMF first frame: submitting input to encoder.");
         }
-        submit_input(
-            self.component.as_ptr(),
-            surface.as_ptr() as *mut sys::AMFData,
-        )?;
+        submit_input(self.component.as_ptr(), input_data.as_ptr())?;
         if is_first_frame {
             info!("AMF first frame: SubmitInput returned successfully.");
         }
@@ -666,29 +664,14 @@ fn copy_cpu_frame_into_surface(
     Ok(())
 }
 
-fn set_surface_timing(
-    surface: *mut sys::AMFSurface,
-    frame_index: u64,
-    target_fps: u32,
-) -> Result<(), EncodeError> {
+fn set_data_timing(data: *mut sys::AMFData, frame_index: u64, target_fps: u32) {
     let fps = u64::from(target_fps.max(1));
     let pts = frame_index.saturating_mul(sys::AMF_SECOND) / fps;
     let duration = (sys::AMF_SECOND / fps).max(1);
-    let pts_status = unsafe { ((*(*surface).pVtbl).SetPts)(surface, pts as i64) };
-    if pts_status != sys::AMF_OK {
-        return Err(EncodeError::EncodeFailed(format!(
-            "AMF SetPts failed with {}",
-            format_amf_status(pts_status)
-        )));
+    unsafe {
+        ((*(*data).pVtbl).SetPts)(data, pts as i64);
+        ((*(*data).pVtbl).SetDuration)(data, duration as i64);
     }
-    let duration_status = unsafe { ((*(*surface).pVtbl).SetDuration)(surface, duration as i64) };
-    if duration_status != sys::AMF_OK {
-        return Err(EncodeError::EncodeFailed(format!(
-            "AMF SetDuration failed with {}",
-            format_amf_status(duration_status)
-        )));
-    }
-    Ok(())
 }
 
 fn submit_input(
@@ -736,6 +719,31 @@ fn query_output_buffer(data: *mut sys::AMFData) -> Result<BufferHandle, EncodeEr
         )));
     }
     BufferHandle::from_raw(interface.cast())
+}
+
+fn query_surface_data(surface: *mut sys::AMFSurface) -> Result<DataHandle, EncodeError> {
+    let mut interface: *mut c_void = ptr::null_mut();
+    let status = unsafe {
+        ((*(*surface).pVtbl).QueryInterface)(
+            surface,
+            &sys::AMF_DATA_IID,
+            &mut interface as *mut _ as *mut *mut c_void,
+        )
+    };
+    if status != sys::AMF_OK {
+        return Err(EncodeError::EncodeFailed(format!(
+            "AMFSurface::QueryInterface(AMFData) failed with {}",
+            format_amf_status(status)
+        )));
+    }
+    let data = DataHandle::from_raw(interface.cast())?;
+    let data_type = unsafe { ((*(*data.as_ptr()).pVtbl).GetDataType)(data.as_ptr()) };
+    if data_type != sys::AMF_DATA_SURFACE {
+        return Err(EncodeError::EncodeFailed(format!(
+            "AMF surface QueryInterface(AMFData) returned unexpected data type {data_type}"
+        )));
+    }
+    Ok(data)
 }
 
 fn read_buffer_bytes(buffer: *mut sys::AMFBuffer) -> Result<Vec<u8>, EncodeError> {
@@ -1268,6 +1276,7 @@ mod sys {
     pub const AMF_MEMORY_HOST: AMF_MEMORY_TYPE = 1;
     pub const AMF_DX11_0: AMF_DX_VERSION = 110;
     pub const AMF_DATA_BUFFER: AMF_DATA_TYPE = 0;
+    pub const AMF_DATA_SURFACE: AMF_DATA_TYPE = 1;
     pub const AMF_SURFACE_BGRA: AMF_SURFACE_FORMAT = 3;
     pub const AMF_PLANE_PACKED: AMF_PLANE_TYPE = 1;
 
@@ -1322,6 +1331,20 @@ mod sys {
         data46: 0xc6,
         data47: 0x86,
         data48: 0x46,
+    };
+
+    pub const AMF_DATA_IID: AMFGuid = AMFGuid {
+        data1: 0xa1159bf6,
+        data2: 0x9104,
+        data3: 0x4107,
+        data41: 0x8e,
+        data42: 0xaa,
+        data43: 0xc5,
+        data44: 0x3d,
+        data45: 0x5d,
+        data46: 0xba,
+        data47: 0xc5,
+        data48: 0x11,
     };
 
     pub const AMF_BUFFER_IID: AMFGuid = AMFGuid {
@@ -1853,9 +1876,9 @@ mod sys {
         pub Interop: unsafe extern "system" fn(*mut AMFData, AMF_MEMORY_TYPE) -> AMF_RESULT,
         pub GetDataType: unsafe extern "system" fn(*mut AMFData) -> AMF_DATA_TYPE,
         pub IsReusable: unsafe extern "system" fn(*mut AMFData) -> amf_bool,
-        pub SetPts: unsafe extern "system" fn(*mut AMFData, amf_pts) -> AMF_RESULT,
+        pub SetPts: unsafe extern "system" fn(*mut AMFData, amf_pts),
         pub GetPts: unsafe extern "system" fn(*mut AMFData) -> amf_pts,
-        pub SetDuration: unsafe extern "system" fn(*mut AMFData, amf_pts) -> AMF_RESULT,
+        pub SetDuration: unsafe extern "system" fn(*mut AMFData, amf_pts),
         pub GetDuration: unsafe extern "system" fn(*mut AMFData) -> amf_pts,
     }
 
@@ -1918,9 +1941,9 @@ mod sys {
         pub Interop: unsafe extern "system" fn(*mut AMFSurface, AMF_MEMORY_TYPE) -> AMF_RESULT,
         pub GetDataType: unsafe extern "system" fn(*mut AMFSurface) -> AMF_DATA_TYPE,
         pub IsReusable: unsafe extern "system" fn(*mut AMFSurface) -> amf_bool,
-        pub SetPts: unsafe extern "system" fn(*mut AMFSurface, amf_pts) -> AMF_RESULT,
+        pub SetPts: unsafe extern "system" fn(*mut AMFSurface, amf_pts),
         pub GetPts: unsafe extern "system" fn(*mut AMFSurface) -> amf_pts,
-        pub SetDuration: unsafe extern "system" fn(*mut AMFSurface, amf_pts) -> AMF_RESULT,
+        pub SetDuration: unsafe extern "system" fn(*mut AMFSurface, amf_pts),
         pub GetDuration: unsafe extern "system" fn(*mut AMFSurface) -> amf_pts,
         pub GetFormat: unsafe extern "system" fn(*mut AMFSurface) -> AMF_SURFACE_FORMAT,
         pub GetPlanesCount: unsafe extern "system" fn(*mut AMFSurface) -> amf_size,
@@ -2021,9 +2044,9 @@ mod sys {
         pub Interop: unsafe extern "system" fn(*mut AMFBuffer, AMF_MEMORY_TYPE) -> AMF_RESULT,
         pub GetDataType: unsafe extern "system" fn(*mut AMFBuffer) -> AMF_DATA_TYPE,
         pub IsReusable: unsafe extern "system" fn(*mut AMFBuffer) -> amf_bool,
-        pub SetPts: unsafe extern "system" fn(*mut AMFBuffer, amf_pts) -> AMF_RESULT,
+        pub SetPts: unsafe extern "system" fn(*mut AMFBuffer, amf_pts),
         pub GetPts: unsafe extern "system" fn(*mut AMFBuffer) -> amf_pts,
-        pub SetDuration: unsafe extern "system" fn(*mut AMFBuffer, amf_pts) -> AMF_RESULT,
+        pub SetDuration: unsafe extern "system" fn(*mut AMFBuffer, amf_pts),
         pub GetDuration: unsafe extern "system" fn(*mut AMFBuffer) -> amf_pts,
         pub SetSize: unsafe extern "system" fn(*mut AMFBuffer, amf_size) -> AMF_RESULT,
         pub GetSize: unsafe extern "system" fn(*mut AMFBuffer) -> amf_size,
