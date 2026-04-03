@@ -1,8 +1,9 @@
 fn main() -> anyhow::Result<()> {
     use tracing_subscriber::EnvFilter;
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("ustreamer_demo=info,ustreamer_transport=info"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("ustreamer_demo=info,ustreamer_transport=info,ustreamer_encode=info")
+    });
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
