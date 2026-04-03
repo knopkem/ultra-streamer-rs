@@ -10,6 +10,7 @@ use std::{
 };
 
 use libloading::Library;
+use tracing::info;
 use ustreamer_capture::CapturedFrame;
 use ustreamer_proto::quality::{EncodeMode, EncodeParams};
 
@@ -246,24 +247,44 @@ impl AmfSession {
         force_keyframe: bool,
     ) -> Result<AmfEncodedOutput, EncodeError> {
         self.update_dynamic_properties(params)?;
+        let is_first_frame = frame_index == 0;
 
+        if is_first_frame {
+            info!(
+                "AMF first frame: allocating host BGRA surface at {}x{}.",
+                width, height
+            );
+        }
         let surface = alloc_host_surface(self.context.as_ptr(), width, height)?;
+        if is_first_frame {
+            info!("AMF first frame: copying staged BGRA pixels into AMF surface.");
+        }
         copy_cpu_frame_into_surface(surface.as_ptr(), frame_bytes, width, height)?;
+        if is_first_frame {
+            info!("AMF first frame: assigning timing metadata.");
+        }
         set_surface_timing(surface.as_ptr(), frame_index, params.target_fps.max(1));
-        if force_keyframe {
+        if params.force_keyframe {
             set_surface_property_int64(
                 surface.as_ptr(),
                 HEVC_FORCE_PICTURE_TYPE_PROPERTY,
                 sys::AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR as i64,
             )?;
             set_surface_property_bool(surface.as_ptr(), HEVC_INSERT_HEADER_PROPERTY, true)?;
+        } else if is_first_frame {
+            info!(
+                "AMF first frame: relying on the encoder's default opening keyframe instead of forcing surface picture type."
+            );
         }
 
+        if is_first_frame {
+            info!("AMF first frame: submitting input to encoder.");
+        }
         submit_input(
             self.component.as_ptr(),
             surface.as_ptr() as *mut sys::AMFData,
         )?;
-        self.wait_for_output(force_keyframe)
+        self.wait_for_output(force_keyframe, is_first_frame)
     }
 
     fn update_dynamic_properties(&mut self, params: &EncodeParams) -> Result<(), EncodeError> {
@@ -293,8 +314,13 @@ impl AmfSession {
         Ok(())
     }
 
-    fn wait_for_output(&mut self, forced_keyframe: bool) -> Result<AmfEncodedOutput, EncodeError> {
+    fn wait_for_output(
+        &mut self,
+        forced_keyframe: bool,
+        log_first_frame: bool,
+    ) -> Result<AmfEncodedOutput, EncodeError> {
         let deadline = Instant::now() + SAMPLE_TIMEOUT;
+        let mut logged_pending = false;
         loop {
             let mut data = ptr::null_mut();
             match query_output(self.component.as_ptr(), &mut data) {
@@ -307,6 +333,9 @@ impl AmfSession {
                         }
                         thread::sleep(POLL_INTERVAL);
                         continue;
+                    }
+                    if log_first_frame {
+                        info!("AMF first frame: received encoded output from QueryOutput.");
                     }
                     let buffer = query_output_buffer(data)?;
                     let encoded = read_buffer_bytes(buffer.as_ptr())?;
@@ -323,6 +352,13 @@ impl AmfSession {
                     });
                 }
                 status if status == sys::AMF_REPEAT || status == sys::AMF_NEED_MORE_INPUT => {
+                    if log_first_frame && !logged_pending {
+                        info!(
+                            "AMF first frame: encoder reported pending output ({}). Waiting...",
+                            format_amf_status(status)
+                        );
+                        logged_pending = true;
+                    }
                     if Instant::now() >= deadline {
                         return Err(EncodeError::EncodeFailed(format!(
                             "timed out waiting for AMF encoded output after {}ms",
