@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/ustreamer-input"
 readme = "../../README.md"
 keywords = ["streaming", "input", "browser", "events", "wgpu"]
+categories = ["web-programming", "gui"]
 
 [dependencies]
 ustreamer-proto = { workspace = true }

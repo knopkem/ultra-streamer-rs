@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/ustreamer-proto"
 readme = "../../README.md"
 keywords = ["streaming", "protocol", "webcodecs", "webtransport", "wgpu"]
+categories = ["multimedia::encoding", "network-programming", "web-programming"]
 
 [dependencies]
 base64 = "0.22"

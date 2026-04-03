@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/ustreamer-encode"
 readme = "../../README.md"
 keywords = ["streaming", "video", "nvenc", "videotoolbox", "wgpu"]
+categories = ["multimedia::encoding", "hardware-support", "graphics"]
 
 [features]
 default = []

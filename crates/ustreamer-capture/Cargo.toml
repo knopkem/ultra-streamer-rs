@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/ustreamer-capture"
 readme = "../../README.md"
 keywords = ["streaming", "capture", "graphics", "wgpu", "gpu"]
+categories = ["multimedia", "graphics", "hardware-support"]
 
 [features]
 default = []

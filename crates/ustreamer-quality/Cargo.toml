@@ -10,6 +10,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/ustreamer-quality"
 readme = "../../README.md"
 keywords = ["streaming", "quality", "latency", "adaptive", "bitrate"]
+categories = ["multimedia", "network-programming"]
 
 [dependencies]
 ustreamer-proto = { workspace = true }
