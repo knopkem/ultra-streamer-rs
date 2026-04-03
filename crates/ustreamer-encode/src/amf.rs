@@ -226,6 +226,7 @@ impl AmfSession {
         width: u32,
         height: u32,
     ) -> Result<Self, EncodeError> {
+        let initial_dynamic = AmfDynamicSettings::from_params(params);
         info!("AMF session: creating context.");
         let context = create_context()?;
         info!("AMF session: initializing context.");
@@ -233,17 +234,21 @@ impl AmfSession {
         info!("AMF session: creating encoder component.");
         let component = create_component(context.as_ptr(), codec)?;
         info!("AMF session: applying static encoder properties.");
-        apply_static_encoder_properties(component.as_ptr(), width, height, params)?;
+        apply_static_encoder_properties(
+            component.as_ptr(),
+            width,
+            height,
+            params,
+            initial_dynamic,
+        )?;
         info!("AMF session: initializing encoder component.");
         initialize_component(component.as_ptr(), codec, width, height)?;
-        let mut session = Self {
+        let session = Self {
             context,
             component,
             dimensions: (width, height),
-            dynamic_settings: None,
+            dynamic_settings: Some(initial_dynamic),
         };
-        info!("AMF session: applying dynamic encoder properties.");
-        session.update_dynamic_properties(params)?;
         info!("AMF session: ready.");
         Ok(session)
     }
@@ -541,43 +546,13 @@ fn apply_static_encoder_properties(
     width: u32,
     height: u32,
     params: &EncodeParams,
+    initial_dynamic: AmfDynamicSettings,
 ) -> Result<(), EncodeError> {
     set_component_property_int64(
         component,
         HEVC_USAGE_PROPERTY,
         sys::AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY_HIGH_QUALITY as i64,
     )?;
-    set_component_property_int64(
-        component,
-        HEVC_RATE_CONTROL_METHOD_PROPERTY,
-        sys::AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR as i64,
-    )?;
-    set_component_property_int64(
-        component,
-        HEVC_OUTPUT_MODE_PROPERTY,
-        sys::AMF_VIDEO_ENCODER_HEVC_OUTPUT_MODE_FRAME as i64,
-    )?;
-    set_component_property_int64(
-        component,
-        HEVC_HEADER_INSERTION_MODE_PROPERTY,
-        sys::AMF_VIDEO_ENCODER_HEVC_HEADER_INSERTION_MODE_IDR_ALIGNED as i64,
-    )?;
-    set_component_property_int64(
-        component,
-        HEVC_QUALITY_PRESET_PROPERTY,
-        sys::AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_HIGH_QUALITY as i64,
-    )?;
-    set_component_property_int64(
-        component,
-        HEVC_GOP_SIZE_PROPERTY,
-        params.target_fps.max(1).min(i64::MAX as u32) as i64,
-    )?;
-    set_component_property_int64(component, HEVC_NUM_GOPS_PER_IDR_PROPERTY, 1)?;
-    set_component_property_int64(component, HEVC_SLICES_PER_FRAME_PROPERTY, 1)?;
-    set_component_property_int64(component, HEVC_INPUT_QUEUE_SIZE_PROPERTY, 1)?;
-    set_component_property_int64(component, HEVC_QUERY_TIMEOUT_PROPERTY, 0)?;
-    set_component_property_bool(component, HEVC_LOW_LATENCY_MODE_PROPERTY, true)?;
-    set_component_property_bool(component, HEVC_NOMINAL_RANGE_PROPERTY, true)?;
     set_component_property_size(
         component,
         HEVC_FRAMESIZE_PROPERTY,
@@ -586,6 +561,37 @@ fn apply_static_encoder_properties(
             height: height.min(i32::MAX as u32) as i32,
         },
     )?;
+    set_component_property_rate(
+        component,
+        HEVC_FRAMERATE_PROPERTY,
+        sys::AMFRate {
+            num: initial_dynamic.target_fps,
+            den: 1,
+        },
+    )?;
+    set_component_property_int64(
+        component,
+        HEVC_RATE_CONTROL_METHOD_PROPERTY,
+        sys::AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR as i64,
+    )?;
+    set_component_property_int64(
+        component,
+        HEVC_GOP_SIZE_PROPERTY,
+        params.target_fps.max(1).min(i64::MAX as u32) as i64,
+    )?;
+    set_component_property_int64(component, HEVC_NUM_GOPS_PER_IDR_PROPERTY, 1)?;
+    set_component_property_int64(
+        component,
+        HEVC_TARGET_BITRATE_PROPERTY,
+        initial_dynamic.target_bitrate_bps.min(i64::MAX as u64) as i64,
+    )?;
+    set_component_property_int64(
+        component,
+        HEVC_PEAK_BITRATE_PROPERTY,
+        initial_dynamic.peak_bitrate_bps.min(i64::MAX as u64) as i64,
+    )?;
+    set_component_property_int64(component, HEVC_QUERY_TIMEOUT_PROPERTY, 1)?;
+    set_component_property_bool(component, HEVC_NOMINAL_RANGE_PROPERTY, true)?;
     Ok(())
 }
 
@@ -1142,22 +1148,16 @@ com_handle!(PlaneHandle, sys::AMFPlane);
 const HEVC_COMPONENT_ID: &str = "AMFVideoEncoderHW_HEVC";
 const HEVC_FRAMESIZE_PROPERTY: &str = "HevcFrameSize";
 const HEVC_USAGE_PROPERTY: &str = "HevcUsage";
-const HEVC_QUALITY_PRESET_PROPERTY: &str = "HevcQualityPreset";
-const HEVC_LOW_LATENCY_MODE_PROPERTY: &str = "LowLatencyInternal";
 const HEVC_NOMINAL_RANGE_PROPERTY: &str = "HevcNominalRange";
 const HEVC_GOP_SIZE_PROPERTY: &str = "HevcGOPSize";
 const HEVC_NUM_GOPS_PER_IDR_PROPERTY: &str = "HevcGOPSPerIDR";
-const HEVC_SLICES_PER_FRAME_PROPERTY: &str = "HevcSlicesPerFrame";
-const HEVC_HEADER_INSERTION_MODE_PROPERTY: &str = "HevcHeaderInsertionMode";
 const HEVC_RATE_CONTROL_METHOD_PROPERTY: &str = "HevcRateControlMethod";
 const HEVC_FRAMERATE_PROPERTY: &str = "HevcFrameRate";
 const HEVC_TARGET_BITRATE_PROPERTY: &str = "HevcTargetBitrate";
 const HEVC_PEAK_BITRATE_PROPERTY: &str = "HevcPeakBitrate";
 const HEVC_QUERY_TIMEOUT_PROPERTY: &str = "HevcQueryTimeout";
-const HEVC_INPUT_QUEUE_SIZE_PROPERTY: &str = "HevcInputQueueSize";
 const HEVC_FORCE_PICTURE_TYPE_PROPERTY: &str = "HevcForcePictureType";
 const HEVC_INSERT_HEADER_PROPERTY: &str = "HevcInsertHeader";
-const HEVC_OUTPUT_MODE_PROPERTY: &str = "HevcOutputMode";
 const HEVC_OUTPUT_DATA_TYPE_PROPERTY: &str = "HevcOutputDataType";
 
 #[cfg(test)]
