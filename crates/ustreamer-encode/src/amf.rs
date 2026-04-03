@@ -295,6 +295,9 @@ impl AmfSession {
             self.component.as_ptr(),
             surface.as_ptr() as *mut sys::AMFData,
         )?;
+        if is_first_frame {
+            info!("AMF first frame: SubmitInput returned successfully.");
+        }
         self.wait_for_output(force_keyframe, is_first_frame)
     }
 
@@ -332,6 +335,9 @@ impl AmfSession {
     ) -> Result<AmfEncodedOutput, EncodeError> {
         let deadline = Instant::now() + SAMPLE_TIMEOUT;
         let mut logged_pending = false;
+        if log_first_frame {
+            info!("AMF first frame: entering QueryOutput loop.");
+        }
         loop {
             let mut data = ptr::null_mut();
             match query_output(self.component.as_ptr(), &mut data) {
