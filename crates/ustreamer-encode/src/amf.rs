@@ -227,12 +227,13 @@ impl AmfSession {
         height: u32,
     ) -> Result<Self, EncodeError> {
         let initial_dynamic = AmfDynamicSettings::from_params(params);
+        let factory = create_factory()?;
         info!("AMF session: creating context.");
-        let context = create_context()?;
+        let context = create_context(factory)?;
         info!("AMF session: initializing context.");
         initialize_context(context.as_ptr())?;
         info!("AMF session: creating encoder component.");
-        let component = create_component(context.as_ptr(), codec)?;
+        let component = create_component(factory, context.as_ptr(), codec)?;
         info!("AMF session: applying static encoder properties.");
         apply_static_encoder_properties(
             component.as_ptr(),
@@ -427,7 +428,7 @@ impl Drop for AmfSession {
     }
 }
 
-fn create_context() -> Result<ContextHandle, EncodeError> {
+fn create_factory() -> Result<*mut sys::AMFFactory, EncodeError> {
     let api = amf_api()?;
     let mut factory = ptr::null_mut();
     let status = unsafe { (api.init)(sys::AMF_FULL_VERSION, &mut factory) };
@@ -443,7 +444,10 @@ fn create_context() -> Result<ContextHandle, EncodeError> {
             "AMFInit returned a null factory pointer".into(),
         ));
     }
+    Ok(factory)
+}
 
+fn create_context(factory: *mut sys::AMFFactory) -> Result<ContextHandle, EncodeError> {
     let mut context = ptr::null_mut();
     let status = unsafe { ((*(*factory).pVtbl).CreateContext)(factory, &mut context) };
     if status != sys::AMF_OK {
@@ -457,41 +461,51 @@ fn create_context() -> Result<ContextHandle, EncodeError> {
 
 fn initialize_context(context: *mut sys::AMFContext) -> Result<(), EncodeError> {
     #[cfg(target_os = "windows")]
-    let status =
-        unsafe { ((*(*context).pVtbl).InitDX11)(context, ptr::null_mut(), sys::AMF_DX11_0) };
+    {
+        let dx11_status =
+            unsafe { ((*(*context).pVtbl).InitDX11)(context, ptr::null_mut(), sys::AMF_DX11_1) };
+        if dx11_status == sys::AMF_OK || dx11_status == sys::AMF_ALREADY_INITIALIZED {
+            return Ok(());
+        }
+
+        info!(
+            "AMF context: InitDX11(DX11_1) returned {}; trying DX9 fallback.",
+            format_amf_status(dx11_status)
+        );
+        let dx9_status = unsafe { ((*(*context).pVtbl).InitDX9)(context, ptr::null_mut()) };
+        if dx9_status == sys::AMF_OK || dx9_status == sys::AMF_ALREADY_INITIALIZED {
+            return Ok(());
+        }
+
+        return Err(EncodeError::InitFailed(format!(
+            "AMF context initialization failed via DX11_1 with {}, and DX9 fallback with {}",
+            format_amf_status(dx11_status),
+            format_amf_status(dx9_status)
+        )));
+    }
 
     #[cfg(target_os = "linux")]
-    let status = {
+    {
         let context1 = query_context1(context)?;
         let status = unsafe {
             ((*(*context1.as_ptr()).pVtbl).InitVulkan)(context1.as_ptr(), ptr::null_mut())
         };
         drop(context1);
-        status
-    };
-
-    if status != sys::AMF_OK && status != sys::AMF_ALREADY_INITIALIZED {
-        return Err(EncodeError::InitFailed(format!(
-            "AMF context initialization failed with {}",
-            format_amf_status(status)
-        )));
+        if status != sys::AMF_OK && status != sys::AMF_ALREADY_INITIALIZED {
+            return Err(EncodeError::InitFailed(format!(
+                "AMF context initialization failed with {}",
+                format_amf_status(status)
+            )));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 fn create_component(
+    factory: *mut sys::AMFFactory,
     context: *mut sys::AMFContext,
     codec: AmfCodec,
 ) -> Result<ComponentHandle, EncodeError> {
-    let mut factory = ptr::null_mut();
-    let status = unsafe { (amf_api()?.init)(sys::AMF_FULL_VERSION, &mut factory) };
-    if status != sys::AMF_OK || factory.is_null() {
-        return Err(EncodeError::InitFailed(format!(
-            "AMFInit failed while creating encoder component: {}",
-            format_amf_status(status)
-        )));
-    }
-
     let mut component = ptr::null_mut();
     let component_id = match codec {
         AmfCodec::Hevc => amf_wide(HEVC_COMPONENT_ID),
@@ -1275,6 +1289,7 @@ mod sys {
 
     pub const AMF_MEMORY_HOST: AMF_MEMORY_TYPE = 1;
     pub const AMF_DX11_0: AMF_DX_VERSION = 110;
+    pub const AMF_DX11_1: AMF_DX_VERSION = 111;
     pub const AMF_DATA_BUFFER: AMF_DATA_TYPE = 0;
     pub const AMF_DATA_SURFACE: AMF_DATA_TYPE = 1;
     pub const AMF_SURFACE_BGRA: AMF_SURFACE_FORMAT = 3;
