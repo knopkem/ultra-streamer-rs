@@ -308,7 +308,7 @@ impl AmfSession {
                         thread::sleep(POLL_INTERVAL);
                         continue;
                     }
-                    let buffer = BufferHandle::from_raw(data as *mut sys::AMFBuffer)?;
+                    let buffer = query_output_buffer(data)?;
                     let encoded = read_buffer_bytes(buffer.as_ptr())?;
                     let is_keyframe = buffer_output_data_type(buffer.as_ptr())
                         .map(|picture_type| {
@@ -636,6 +636,32 @@ fn query_output(
     data: *mut *mut sys::AMFData,
 ) -> sys::AMF_RESULT {
     unsafe { ((*(*component).pVtbl).QueryOutput)(component, data) }
+}
+
+fn query_output_buffer(data: *mut sys::AMFData) -> Result<BufferHandle, EncodeError> {
+    let data = DataHandle::from_raw(data)?;
+    let data_type = unsafe { ((*(*data.as_ptr()).pVtbl).GetDataType)(data.as_ptr()) };
+    if data_type != sys::AMF_DATA_BUFFER {
+        return Err(EncodeError::EncodeFailed(format!(
+            "AMF QueryOutput returned unexpected data type {data_type} instead of AMF_DATA_BUFFER"
+        )));
+    }
+
+    let mut interface: *mut c_void = ptr::null_mut();
+    let status = unsafe {
+        ((*(*data.as_ptr()).pVtbl).QueryInterface)(
+            data.as_ptr(),
+            &sys::AMF_BUFFER_IID,
+            &mut interface,
+        )
+    };
+    if status != sys::AMF_OK {
+        return Err(EncodeError::EncodeFailed(format!(
+            "AMFData::QueryInterface(AMFBuffer) failed with {}",
+            format_amf_status(status)
+        )));
+    }
+    BufferHandle::from_raw(interface.cast())
 }
 
 fn read_buffer_bytes(buffer: *mut sys::AMFBuffer) -> Result<Vec<u8>, EncodeError> {
@@ -1055,6 +1081,7 @@ com_handle!(ContextHandle, sys::AMFContext);
 #[cfg(target_os = "linux")]
 com_handle!(Context1Handle, sys::AMFContext1);
 com_handle!(ComponentHandle, sys::AMFComponent);
+com_handle!(DataHandle, sys::AMFData);
 com_handle!(SurfaceHandle, sys::AMFSurface);
 com_handle!(BufferHandle, sys::AMFBuffer);
 com_handle!(PlaneHandle, sys::AMFPlane);
@@ -1172,6 +1199,7 @@ mod sys {
 
     pub const AMF_MEMORY_HOST: AMF_MEMORY_TYPE = 1;
     pub const AMF_DX11_0: AMF_DX_VERSION = 110;
+    pub const AMF_DATA_BUFFER: AMF_DATA_TYPE = 0;
     pub const AMF_SURFACE_BGRA: AMF_SURFACE_FORMAT = 3;
     pub const AMF_PLANE_PACKED: AMF_PLANE_TYPE = 1;
 
@@ -1226,6 +1254,20 @@ mod sys {
         data46: 0xc6,
         data47: 0x86,
         data48: 0x46,
+    };
+
+    pub const AMF_BUFFER_IID: AMFGuid = AMFGuid {
+        data1: 0xb04b7248,
+        data2: 0xb6f0,
+        data3: 0x4321,
+        data41: 0xb6,
+        data42: 0x91,
+        data43: 0xba,
+        data44: 0xa4,
+        data45: 0x74,
+        data46: 0x0f,
+        data47: 0x9f,
+        data48: 0xcb,
     };
 
     pub const AMF_VARIANT_BOOL: AMF_VARIANT_TYPE = 1;
