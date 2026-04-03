@@ -646,16 +646,21 @@ fn copy_cpu_frame_into_surface(
             "AMF BGRA surface reported zero planes".into(),
         ));
     }
+    // GetPlaneAt returns a borrowed pointer owned by the surface — do NOT Release it.
     let plane = unsafe { ((*(*surface).pVtbl).GetPlaneAt)(surface, 0) };
-    let plane = PlaneHandle::from_raw(plane)?;
-    let destination = unsafe { ((*(*plane.as_ptr()).pVtbl).GetNative)(plane.as_ptr()) } as *mut u8;
+    if plane.is_null() {
+        return Err(EncodeError::EncodeFailed(
+            "AMF GetPlaneAt(0) returned a null pointer".into(),
+        ));
+    }
+    let destination = unsafe { ((*(*plane).pVtbl).GetNative)(plane) } as *mut u8;
     if destination.is_null() {
         return Err(EncodeError::EncodeFailed(
             "AMF packed BGRA plane exposed a null native pointer".into(),
         ));
     }
 
-    let destination_pitch = unsafe { ((*(*plane.as_ptr()).pVtbl).GetHPitch)(plane.as_ptr()) };
+    let destination_pitch = unsafe { ((*(*plane).pVtbl).GetHPitch)(plane) };
     if destination_pitch <= 0 {
         return Err(EncodeError::EncodeFailed(format!(
             "AMF packed BGRA plane reported invalid pitch {destination_pitch}"
@@ -1161,7 +1166,9 @@ com_handle!(ComponentHandle, sys::AMFComponent);
 com_handle!(DataHandle, sys::AMFData);
 com_handle!(SurfaceHandle, sys::AMFSurface);
 com_handle!(BufferHandle, sys::AMFBuffer);
-com_handle!(PlaneHandle, sys::AMFPlane);
+// Note: AMFPlane pointers from GetPlaneAt() are borrowed (owned by the surface).
+// Do NOT wrap them in a com_handle that calls Release — that would over-release
+// and corrupt the surface before SubmitInput.
 
 const HEVC_COMPONENT_ID: &str = "AMFVideoEncoderHW_HEVC";
 const HEVC_FRAMESIZE_PROPERTY: &str = "HevcFrameSize";
